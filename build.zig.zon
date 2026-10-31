@@ -1,0 +1,14 @@
+.{
+    .name = .wayman,
+    .version = "0.1.0",
+    .fingerprint = 0x836363fb22d2296d, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "protocols",
+        "README.md",
+    },
+}
