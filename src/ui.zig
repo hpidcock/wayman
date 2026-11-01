@@ -12,6 +12,7 @@ const icon = @import("icon.zig");
 const agent = @import("agent.zig");
 const proton = @import("proton.zig");
 const portal = @import("portal.zig");
+const clock = @import("clock.zig");
 const Theme = @import("theme.zig").Theme;
 
 const log = std.log.scoped(.ui);
@@ -50,7 +51,13 @@ const HitKind = enum {
     country,
     picker_back,
     portal_open,
+    zone_row,
+    zone_item,
+    zone_back,
 };
+
+pub const View = enum { wifi, clock };
+const clock_radius: f64 = 96;
 
 const Hit = struct {
     kind: HitKind,
@@ -109,7 +116,15 @@ pub const Ui = struct {
     agent: *agent.Agent,
     proton: *proton.Client,
     portal: *portal.Detector,
+    timedate: *clock.Timedate,
     theme: Theme,
+    view: View = .wifi,
+    /// Time zone picker (clock view) replaces the clock while open.
+    zone_picker: bool = false,
+    zone_search: std.ArrayList(u8) = .empty,
+    zone_filtered: std.ArrayList(usize) = .empty,
+    clock_error: ?[]u8 = null,
+    last_second: i64 = 0,
     open: bool = false,
     needs_redraw: bool = false,
     hits: std.ArrayList(Hit) = .empty,
@@ -122,19 +137,58 @@ pub const Ui = struct {
     /// The country picker replaces the list while open.
     picker: bool = false,
 
-    pub fn init(self: *Ui, gpa: Allocator, wl_client: *wl.Client, nm_client: *nm.Client, agent_client: *agent.Agent, proton_client: *proton.Client, portal_detector: *portal.Detector, theme: Theme) void {
-        self.* = .{ .gpa = gpa, .wl = wl_client, .nm = nm_client, .agent = agent_client, .proton = proton_client, .portal = portal_detector, .theme = theme };
+    pub fn init(self: *Ui, gpa: Allocator, wl_client: *wl.Client, nm_client: *nm.Client, agent_client: *agent.Agent, proton_client: *proton.Client, portal_detector: *portal.Detector, timedate: *clock.Timedate, theme: Theme) void {
+        self.* = .{ .gpa = gpa, .wl = wl_client, .nm = nm_client, .agent = agent_client, .proton = proton_client, .portal = portal_detector, .timedate = timedate, .theme = theme };
     }
 
     pub fn deinit(self: *Ui) void {
         self.cancelPrompt();
         self.hits.deinit(self.gpa);
+        self.zone_search.deinit(self.gpa);
+        self.zone_filtered.deinit(self.gpa);
+        if (self.clock_error) |e| self.gpa.free(e);
     }
 
     // ---- open / close -----------------------------------------------------
 
     pub fn toggle(self: *Ui) void {
-        if (self.open) self.close() else self.openPopup();
+        self.toggleView(.wifi);
+    }
+
+    pub fn toggleClock(self: *Ui) void {
+        self.toggleView(.clock);
+    }
+
+    /// Opens the popup on `view`, switches an open popup to it, or closes
+    /// the popup when it already shows that view.
+    fn toggleView(self: *Ui, view: View) void {
+        if (self.open and self.view == view) {
+            self.close();
+            return;
+        }
+        self.view = view;
+        self.zone_picker = false;
+        if (self.open) {
+            self.scroll = 0;
+            self.hover = null;
+            self.relayout();
+        } else {
+            self.openPopup();
+        }
+    }
+
+    /// Called every loop iteration; redraws the clock once a second.
+    pub fn tick(self: *Ui) void {
+        if (!self.open or self.view != .clock or self.zone_picker) return;
+        const now = clock.epochSeconds();
+        if (now != self.last_second) {
+            self.last_second = now;
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn clockOpen(self: *const Ui) bool {
+        return self.open and self.view == .clock and !self.zone_picker;
     }
 
     pub fn openPopup(self: *Ui) void {
@@ -166,6 +220,7 @@ pub const Ui = struct {
         self.needs_redraw = false;
         self.cancelPrompt();
         self.picker = false;
+        self.zone_picker = false;
         self.hover = null;
         self.pointer = null;
     }
@@ -346,7 +401,13 @@ pub const Ui = struct {
     fn desiredHeight(self: *Ui) u32 {
         const m = self.nm.model;
         var list: f64 = 0;
-        if (self.picker) {
+        if (self.view == .clock) {
+            if (self.zone_picker) {
+                list = small_row_h + field_row_h + @as(f64, @floatFromInt(self.zone_filtered.items.len)) * small_row_h;
+            } else {
+                list = 2 * clock_radius + 28 + 44 + 26 + 10 + row_h;
+            }
+        } else if (self.picker) {
             list = small_row_h + @as(f64, @floatFromInt(1 + self.proton.countryList().len)) * row_h;
         } else {
             list = message_h;
@@ -369,7 +430,24 @@ pub const Ui = struct {
     }
 
     fn footerError(self: *Ui) ?[]const u8 {
+        if (self.view == .clock) return self.clock_error;
         return self.nm.lastError() orelse self.proton.lastError();
+    }
+
+    fn setClockError(self: *Ui, text: ?[]const u8) void {
+        if (self.clock_error) |e| self.gpa.free(e);
+        self.clock_error = if (text) |t| (self.gpa.dupe(u8, t) catch null) else null;
+    }
+
+    fn refilterZones(self: *Ui) void {
+        self.zone_filtered.clearRetainingCapacity();
+        const zones = self.timedate.listZones() catch {
+            self.setClockError("Couldn't list time zones");
+            return;
+        };
+        for (zones, 0..) |z, i| {
+            if (zoneMatches(z, self.zone_search.items)) self.zone_filtered.append(self.gpa, i) catch break;
+        }
     }
 
     // ---- input ------------------------------------------------------------
@@ -447,6 +525,10 @@ pub const Ui = struct {
     }
 
     pub fn onKey(self: *Ui, sym: u32, text: []const u8, mods: wl.Modifiers) void {
+        if (self.zone_picker) {
+            self.onZoneKey(sym, text, mods);
+            return;
+        }
         switch (sym) {
             c.XKB_KEY_Escape => {
                 if (self.prompt != null) {
@@ -502,6 +584,55 @@ pub const Ui = struct {
                 }
             },
         }
+    }
+
+    fn onZoneKey(self: *Ui, sym: u32, text: []const u8, mods: wl.Modifiers) void {
+        switch (sym) {
+            c.XKB_KEY_Escape => {
+                self.zone_picker = false;
+                self.scroll = 0;
+                self.relayout();
+            },
+            c.XKB_KEY_Return, c.XKB_KEY_KP_Enter => {
+                if (self.zone_filtered.items.len > 0) self.chooseZone(self.zone_filtered.items[0]);
+            },
+            c.XKB_KEY_BackSpace => {
+                if (self.zone_search.items.len > 0) {
+                    var n = self.zone_search.items.len - 1;
+                    while (n > 0 and (self.zone_search.items[n] & 0xc0) == 0x80) n -= 1;
+                    self.zone_search.shrinkRetainingCapacity(n);
+                    self.refilterZones();
+                    self.scroll = 0;
+                    self.relayout();
+                }
+            },
+            else => {
+                if (mods.ctrl) {
+                    if (sym == c.XKB_KEY_u) {
+                        self.zone_search.clearRetainingCapacity();
+                        self.refilterZones();
+                        self.relayout();
+                    }
+                    return;
+                }
+                if (text.len > 0 and text[0] >= 0x20 and text[0] != 0x7f) {
+                    self.zone_search.appendSlice(self.gpa, text) catch {};
+                    self.refilterZones();
+                    self.scroll = 0;
+                    self.relayout();
+                }
+            },
+        }
+    }
+
+    fn chooseZone(self: *Ui, index: usize) void {
+        const zones = self.timedate.listZones() catch return;
+        if (index >= zones.len) return;
+        self.setClockError(null);
+        if (self.timedate.setZone(zones[index])) |err| self.setClockError(err);
+        self.zone_picker = false;
+        self.scroll = 0;
+        self.relayout();
     }
 
     fn focusedField(self: *Ui) ?*PromptField {
@@ -565,6 +696,21 @@ pub const Ui = struct {
                 }
             },
             .portal_open => self.portal.openBrowser(),
+            .zone_row => {
+                self.setClockError(null);
+                self.zone_search.clearRetainingCapacity();
+                self.refilterZones();
+                self.zone_picker = true;
+                self.scroll = 0;
+            },
+            .zone_back => {
+                self.zone_picker = false;
+                self.scroll = 0;
+            },
+            .zone_item => {
+                self.chooseZone(hit.index);
+                return;
+            },
             .proton_sign_in => self.startProtonLogin(),
             .proton_2fa => self.startProton2fa(),
             .proton_sign_out => self.proton.logout(),
@@ -638,7 +784,9 @@ pub const Ui = struct {
         c.cairo_rectangle(cr, 0, list_top, w, self.list_h);
         c.cairo_clip(cr);
         var y = list_top - self.scroll;
-        if (self.picker) {
+        if (self.view == .clock) {
+            if (self.zone_picker) self.drawZonePicker(cr, w, y) else self.drawClock(cr, w, y);
+        } else if (self.picker) {
             self.drawPicker(cr, w, y);
         } else {
             switch (m.status) {
@@ -713,6 +861,14 @@ pub const Ui = struct {
 
     fn drawHeader(self: *Ui, cr: *c.cairo_t, w: f64) void {
         const m = self.nm.model;
+        if (self.view == .clock) {
+            _ = drawText(cr, pad, header_h / 2, "Clock", self.theme.font_title, self.theme.text, null);
+            var zbuf: [160]u8 = undefined;
+            const zone = std.fmt.bufPrint(&zbuf, "{s}", .{self.timedate.zone}) catch "";
+            _ = drawTextAligned(cr, w - pad, header_h / 2, zone, self.theme.font_small, self.theme.muted, .right);
+            self.separator(cr, 0, w, header_h - 0.5);
+            return;
+        }
         _ = drawText(cr, pad, header_h / 2, "Wi-Fi", self.theme.font_title, self.theme.text, null);
 
         const tw: f64 = 42;
@@ -915,6 +1071,53 @@ pub const Ui = struct {
         self.addHit(.{ .kind = .country, .index = index, .x = 0, .y = y, .w = w, .h = row_h });
     }
 
+    fn drawClock(self: *Ui, cr: *c.cairo_t, w: f64, y0: f64) void {
+        const tm = clock.localParts(clock.epochSeconds());
+        const cx = w / 2;
+        const cy = y0 + 14 + clock_radius;
+        clock.drawFace(cr, cx, cy, clock_radius, &tm, self.theme.field.withAlpha(0.12), self.theme.muted, self.theme.text, self.theme.accent);
+        var y = y0 + 2 * clock_radius + 28;
+        var buf: [96]u8 = undefined;
+        const time_text = clock.format(&buf, "%H:%M:%S", &tm);
+        _ = drawTextAligned(cr, cx, y + 22, time_text, self.theme.font_large, self.theme.text, .center);
+        y += 44;
+        var dbuf: [128]u8 = undefined;
+        const date_text = clock.format(&dbuf, "%A, %-d %B %Y", &tm);
+        _ = drawTextAligned(cr, cx, y + 13, date_text, self.theme.font_regular, self.theme.muted, .center);
+        y += 26 + 10;
+        self.separator(cr, 0, w, y + 0.5);
+        var obuf: [16]u8 = undefined;
+        const offset = clock.utcOffset(&obuf, &tm);
+        var vbuf: [200]u8 = undefined;
+        const value = std.fmt.bufPrint(&vbuf, "{s} ({s})", .{ self.timedate.zone, offset }) catch offset;
+        self.drawLinkRow(cr, w, y, row_h, "Time zone", value, true, .zone_row, false);
+    }
+
+    fn drawZonePicker(self: *Ui, cr: *c.cairo_t, w: f64, y0: f64) void {
+        var y = y0;
+        self.drawLinkRow(cr, w, y, small_row_h, "\u{2039} Back", "Choose a time zone", false, .zone_back, true);
+        y += small_row_h;
+        const field: PromptField = .{ .label = "Type to search", .text = self.zone_search, .masked = false };
+        self.drawField(cr, pad, y + (field_row_h - field_h) / 2, w - 2 * pad, &field, 0, true);
+        y += field_row_h;
+        const zones = self.timedate.listZones() catch &.{};
+        for (self.zone_filtered.items) |zi| {
+            if (zi >= zones.len) continue;
+            const zone = zones[zi];
+            const selected = std.mem.eql(u8, zone, self.timedate.zone);
+            self.hoverRow(cr, w, y, small_row_h, .zone_item, zi);
+            const cy = y + small_row_h / 2;
+            var right = w - pad;
+            if (selected) right -= drawTextAligned(cr, right, cy, "\u{2713}", self.theme.font_regular, self.theme.accent, .right) + 10;
+            _ = drawText(cr, pad + 32, cy, zone, if (selected) self.theme.font_bold else self.theme.font_regular, if (selected) self.theme.accent else self.theme.text, right - pad - 38);
+            self.addHit(.{ .kind = .zone_item, .index = zi, .x = 0, .y = y, .w = w, .h = small_row_h });
+            y += small_row_h;
+        }
+        if (self.zone_filtered.items.len == 0) {
+            _ = drawTextAligned(cr, w / 2, y + small_row_h / 2, "No matching zone", self.theme.font_regular, self.theme.muted, .center);
+        }
+    }
+
     fn drawWifiPrompt(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, p: Prompt) void {
         const fy = y + (entry_h - field_h) / 2;
         const button_w: f64 = 80;
@@ -1083,4 +1286,28 @@ fn drawTextAligned(cr: *c.cairo_t, anchor: f64, cy: f64, text: []const u8, font:
     c.cairo_move_to(cr, x, cy - size.h / 2);
     c.pango_cairo_show_layout(cr, layout);
     return size.w;
+}
+
+/// Case-insensitive substring match where '_' and ' ' are interchangeable.
+fn zoneMatches(zone: []const u8, query: []const u8) bool {
+    if (query.len == 0) return true;
+    if (query.len > zone.len) return false;
+    var i: usize = 0;
+    outer: while (i + query.len <= zone.len) : (i += 1) {
+        for (query, 0..) |qc, k| {
+            const zc = zone[i + k];
+            const a = if (qc == ' ') '_' else std.ascii.toLower(qc);
+            const b = if (zc == ' ') '_' else std.ascii.toLower(zc);
+            if (a != b) continue :outer;
+        }
+        return true;
+    }
+    return false;
+}
+
+test "zone search" {
+    try std.testing.expect(zoneMatches("America/New_York", "new york"));
+    try std.testing.expect(zoneMatches("Europe/Berlin", "BER"));
+    try std.testing.expect(!zoneMatches("Europe/Berlin", "paris"));
+    try std.testing.expect(zoneMatches("UTC", ""));
 }

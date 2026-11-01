@@ -43,6 +43,8 @@ pub const Theme = struct {
     font_bold: [:0]const u8,
     font_title: [:0]const u8,
     font_small: [:0]const u8,
+    /// Big digits for the clock.
+    font_large: [:0]const u8,
     /// Set when the font strings were allocated and must be freed.
     owned: bool = false,
 
@@ -62,6 +64,7 @@ pub const Theme = struct {
         .font_bold = "Sans Bold 10.5",
         .font_title = "Sans Bold 12",
         .font_small = "Sans 9",
+        .font_large = "Sans Bold 26",
     };
 
     pub fn deinit(self: *Theme, gpa: Allocator) void {
@@ -70,6 +73,7 @@ pub const Theme = struct {
         gpa.free(self.font_bold);
         gpa.free(self.font_title);
         gpa.free(self.font_small);
+        gpa.free(self.font_large);
         self.owned = false;
     }
 
@@ -181,6 +185,8 @@ pub const Theme = struct {
         t.font_title = try std.fmt.allocPrintSentinel(gpa, "{s} Bold {d}px", .{ family, size_px + 2.0 }, 0);
         errdefer gpa.free(t.font_title);
         t.font_small = try std.fmt.allocPrintSentinel(gpa, "{s} {d}px", .{ family, @max(8.0, size_px - 2.0) }, 0);
+        errdefer gpa.free(t.font_small);
+        t.font_large = try std.fmt.allocPrintSentinel(gpa, "{s} Bold {d}px", .{ family, size_px * 2.4 }, 0);
         t.owned = true;
         return t;
     }

@@ -88,6 +88,36 @@ Only one instance runs at a time (a lock in `$XDG_RUNTIME_DIR`); a second
 one exits with a message. Make sure your bar has a tray, e.g. `"modules-right": ["tray", ...]` in
 waybar. Logs go to stderr; debug builds are more verbose.
 
+## Clock mode
+
+wayman can also be the bar's clock. The running daemon serves a second
+popup with an analogue clock, the date, and a time zone picker that sets
+the system zone through systemd's `timedated` (polkit may ask for your
+password; a polkit agent has to be running under sway for that). Two small
+commands talk to the daemon over D-Bus (`dev.wayman` on the session bus):
+
+```
+wayman clock status [--format '%a %-d %b  %H:%M']   # JSON lines for waybar
+wayman clock toggle                                  # open/close the clock popup
+wayman toggle                                        # open/close the Wi-Fi popup
+wayman quit                                          # stop the daemon
+```
+
+Waybar configuration, replacing the built-in `clock` module:
+
+```json
+"custom/clock": {
+  "exec": "wayman clock status",
+  "return-type": "json",
+  "on-click": "wayman clock toggle"
+},
+"modules-right": ["battery", "custom/clock", "tray"]
+```
+
+The label uses strftime formats and updates once a minute, or once a second
+when the format shows seconds. Style it as `#custom-clock`. The label
+follows system time zone changes immediately.
+
 ## Theming
 
 By default wayman reads waybar's `style.css` (from `$XDG_CONFIG_HOME/waybar`,
@@ -126,6 +156,8 @@ wayman --no-waybar-theme   # built-in theme
 | `src/icon.zig` | Cairo drawing helpers and tray pixmap rendering             |
 | `src/agent.zig`| NetworkManager secret agent (VPN and Wi-Fi credential prompts) |
 | `src/portal.zig` | Captive portal probe and browser launcher                 |
+| `src/clock.zig` | Time formatting, timedated client, analogue clock face      |
+| `src/control.zig` | D-Bus control interface and the CLI client side           |
 | `src/proton.zig` | Proton VPN controller: session, worker thread, server choice |
 | `src/proton/api.zig` | HTTPS client for the Proton REST API                 |
 | `src/proton/srp.zig` | Proton's SRP login maths (bcrypt + PMHash)            |

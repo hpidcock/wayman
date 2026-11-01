@@ -16,6 +16,8 @@ const icon = @import("icon.zig");
 const agent = @import("agent.zig");
 const proton = @import("proton.zig");
 const portal = @import("portal.zig");
+const clock = @import("clock.zig");
+const control = @import("control.zig");
 const Theme = @import("theme.zig").Theme;
 
 const log = std.log.scoped(.wayman);
@@ -38,6 +40,8 @@ const App = struct {
     agent: agent.Agent,
     proton: proton.Client,
     portal: portal.Detector,
+    timedate: clock.Timedate,
+    control: control.Server,
     theme: Theme,
     next_scan_ms: i64 = 0,
     icon_key: u32 = std.math.maxInt(u32),
@@ -65,6 +69,22 @@ const App = struct {
         const app = fromCtx(ctx);
         app.updateTray();
         app.ui.onModelChanged();
+    }
+
+    fn onTimedateChange(ctx: ?*anyopaque) void {
+        fromCtx(ctx).ui.onModelChanged();
+    }
+
+    fn onControl(ctx: ?*anyopaque, action: control.Action) void {
+        const app = fromCtx(ctx);
+        switch (action) {
+            .toggle_wifi => app.ui.toggle(),
+            .toggle_clock => app.ui.toggleClock(),
+            .quit => {
+                log.info("quit requested over D-Bus", .{});
+                app.quit = true;
+            },
+        }
     }
 
     fn updateTray(app: *App) void {
@@ -199,6 +219,7 @@ const App = struct {
             // Deferred NetworkManager work: coalesced refreshes, cleanups.
             app.nm.poll(now);
             app.portal.poll(now);
+            app.ui.tick();
             if (app.ui.open and now >= app.next_scan_ms) {
                 app.nm.requestScan();
                 app.next_scan_ms = now + scan_interval_ms;
@@ -211,6 +232,10 @@ const App = struct {
             if (app.nm.nextDeadline(now)) |d| timeout = @intCast(@min(d, std.math.maxInt(i32)));
             if (app.portal.nextDeadline(now)) |d| {
                 const until: i32 = @intCast(@min(d, std.math.maxInt(i32)));
+                timeout = if (timeout < 0) until else @min(timeout, until);
+            }
+            if (app.ui.clockOpen()) {
+                const until: i32 = @intCast(@max(10, 1000 - clock.msIntoSecond()));
                 timeout = if (timeout < 0) until else @min(timeout, until);
             }
             if (app.ui.open) {
@@ -255,9 +280,15 @@ const App = struct {
 };
 
 const usage =
-    \\Usage: wayman [options]
+    \\Usage: wayman [options]              run the daemon (tray icon and popups)
+    \\       wayman toggle                 open or close the Wi-Fi popup
+    \\       wayman clock toggle           open or close the clock popup
+    \\       wayman clock status [--format FMT]
+    \\                                     stream the date/time label for a
+    \\                                     waybar custom module (JSON lines)
+    \\       wayman quit                   stop the running daemon
     \\
-    \\A Wi-Fi tray icon and popup for sway and other wlroots compositors.
+    \\A Wi-Fi tray icon, clock and popups for sway and other wlroots compositors.
     \\
     \\Options:
     \\  --style PATH       Load colours and fonts from this CSS file
@@ -273,11 +304,38 @@ const Options = struct {
     use_waybar_theme: bool = true,
 };
 
-fn parseArgs(args: std.process.Args) !Options {
+fn parseArgs(args: std.process.Args, init: std.process.Init) !Options {
     var opts: Options = .{};
     var it = args.iterate();
     _ = it.next();
     while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "toggle")) {
+            std.process.exit(if (sendOrComplain(.toggle_wifi)) 0 else 1);
+        } else if (std.mem.eql(u8, arg, "quit")) {
+            std.process.exit(if (sendOrComplain(.quit)) 0 else 1);
+        } else if (std.mem.eql(u8, arg, "clock")) {
+            const sub = it.next() orelse "status";
+            if (std.mem.eql(u8, sub, "toggle")) {
+                std.process.exit(if (sendOrComplain(.toggle_clock)) 0 else 1);
+            } else if (std.mem.eql(u8, sub, "status")) {
+                var fmt: []const u8 = clock.default_format;
+                while (it.next()) |a| {
+                    if (std.mem.startsWith(u8, a, "--format=")) {
+                        fmt = a["--format=".len..];
+                    } else if (std.mem.eql(u8, a, "--format")) {
+                        fmt = it.next() orelse fmt;
+                    } else {
+                        std.debug.print("unknown option: {s}\n{s}", .{ a, usage });
+                        std.process.exit(2);
+                    }
+                }
+                try runClockStatus(init, fmt);
+                std.process.exit(0);
+            } else {
+                std.debug.print("unknown clock command: {s}\n{s}", .{ sub, usage });
+                std.process.exit(2);
+            }
+        }
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
@@ -299,6 +357,77 @@ fn parseArgs(args: std.process.Args) !Options {
         }
     }
     return opts;
+}
+
+fn sendOrComplain(action: control.Action) bool {
+    if (control.send(action)) return true;
+    std.debug.print("wayman is not running\n", .{});
+    return false;
+}
+
+const Label = struct { text: []const u8, tooltip: []const u8, class: []const u8 = "clock" };
+
+/// `wayman clock status`: prints a JSON line for waybar whenever the label
+/// changes, following system time zone changes.
+fn runClockStatus(init: std.process.Init, fmt_text: []const u8) !void {
+    const gpa = init.gpa;
+    const fmt = try gpa.dupeSentinel(u8, fmt_text, 0);
+    defer gpa.free(fmt);
+    const per_second = clock.showsSeconds(fmt);
+
+    // Follow zone changes when the system bus is reachable.
+    var td: ?clock.Timedate = null;
+    var td_fd: ?std.posix.fd_t = null;
+    const sys = dbus.Connection.open(.system) catch null;
+    if (sys) |conn| {
+        td = undefined;
+        if (td.?.init(gpa, conn)) {
+            td_fd = conn.fd() catch null;
+        } else |_| {
+            td = null;
+        }
+    }
+    defer if (td) |*t| t.deinit();
+
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buf);
+    var last: ?[]u8 = null;
+    defer if (last) |l| gpa.free(l);
+
+    while (true) {
+        const now = clock.epochSeconds();
+        const tm = clock.localParts(now);
+        var tbuf: [256]u8 = undefined;
+        const text = clock.format(&tbuf, fmt, &tm);
+        var tipbuf: [256]u8 = undefined;
+        var obuf: [16]u8 = undefined;
+        const date = clock.format(&tipbuf, "%A, %-d %B %Y  %H:%M:%S", &tm);
+        var full: [400]u8 = undefined;
+        const tooltip = std.fmt.bufPrint(&full, "{s}\n{s} ({s})", .{ date, if (td) |t| t.zone else "local time", clock.utcOffset(&obuf, &tm) }) catch date;
+        if (last == null or !std.mem.eql(u8, last.?, text) or per_second) {
+            const line = try std.json.Stringify.valueAlloc(gpa, Label{ .text = text, .tooltip = tooltip }, .{});
+            defer gpa.free(line);
+            // Waybar closing the pipe is the normal way for this loop to end.
+            stdout.interface.writeAll(line) catch std.process.exit(0);
+            stdout.interface.writeByte('\n') catch std.process.exit(0);
+            stdout.interface.flush() catch std.process.exit(0);
+            if (last) |l| gpa.free(l);
+            last = try gpa.dupe(u8, text);
+        }
+        // Sleep to the next second or minute boundary.
+        const ms_in = clock.msIntoSecond();
+        var wait_ms: i32 = @intCast(1000 - ms_in + 20);
+        if (!per_second) wait_ms += @intCast((59 - @mod(tm.tm_sec, 60)) * 1000);
+        if (td_fd) |fd| {
+            var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            _ = std.posix.poll(&fds, wait_ms) catch {};
+            sys.?.dispatch();
+            sys.?.flush();
+        } else {
+            var fds = [_]std.posix.pollfd{};
+            _ = std.posix.poll(&fds, wait_ms) catch {};
+        }
+    }
 }
 
 fn loadTheme(gpa: std.mem.Allocator, init: std.process.Init, opts: Options) !Theme {
@@ -334,7 +463,7 @@ fn acquireInstanceLock(environ: *std.process.Environ.Map) !void {
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    const opts = try parseArgs(init.minimal.args);
+    const opts = try parseArgs(init.minimal.args, init);
     acquireInstanceLock(init.environ_map) catch |err| switch (err) {
         error.AlreadyRunning => std.process.exit(1),
         else => return err,
@@ -352,6 +481,8 @@ pub fn main(init: std.process.Init) !void {
         .agent = undefined,
         .proton = undefined,
         .portal = undefined,
+        .timedate = undefined,
+        .control = undefined,
         .theme = try loadTheme(gpa, init, opts),
     };
     defer app.theme.deinit(gpa);
@@ -399,7 +530,14 @@ pub fn main(init: std.process.Init) !void {
     app.portal.on_change = App.onPortalChange;
     app.portal.on_change_ctx = app;
 
-    app.ui.init(gpa, &app.wl, &app.nm, &app.agent, &app.proton, &app.portal, app.theme);
+    try app.timedate.init(gpa, app.system);
+    defer app.timedate.deinit();
+    app.timedate.on_change = App.onTimedateChange;
+    app.timedate.on_change_ctx = app;
+
+    try app.control.init(app.session, App.onControl, app);
+
+    app.ui.init(gpa, &app.wl, &app.nm, &app.agent, &app.proton, &app.portal, &app.timedate, app.theme);
     defer app.ui.deinit();
 
     app.nm.refresh();
@@ -415,4 +553,6 @@ test {
     _ = agent;
     _ = proton;
     _ = portal;
+    _ = clock;
+    _ = control;
 }
