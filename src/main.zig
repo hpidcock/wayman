@@ -13,6 +13,8 @@ const sni = @import("sni.zig");
 const wl = @import("wl.zig");
 const ui = @import("ui.zig");
 const icon = @import("icon.zig");
+const agent = @import("agent.zig");
+const Theme = @import("theme.zig").Theme;
 
 const log = std.log.scoped(.wayman);
 
@@ -31,6 +33,8 @@ const App = struct {
     nm: nm.Client,
     tray: sni.Item,
     ui: ui.Ui,
+    agent: agent.Agent,
+    theme: Theme,
     next_scan_ms: i64 = 0,
     icon_key: u32 = std.math.maxInt(u32),
     quit: bool = false,
@@ -60,9 +64,10 @@ const App = struct {
             .disabled => .off,
         };
         const bars: u8 = if (m.status == .connected) nm.strengthToBars(m.active_strength) else 0;
-        const key = @as(u32, bars) | (@as(u32, @backingInt(look)) << 8);
+        const vpn_badge = m.vpn_on_count > 0;
+        const key = @as(u32, bars) | (@as(u32, @backingInt(look)) << 8) | (@as(u32, @intFromBool(vpn_badge)) << 16);
         if (key != app.icon_key) {
-            if (app.renderIcons(bars, look)) |pixmaps| {
+            if (app.renderIcons(bars, look, vpn_badge)) |pixmaps| {
                 app.tray.setIcon(pixmaps);
                 app.icon_key = key;
             } else |err| {
@@ -72,17 +77,22 @@ const App = struct {
 
         var buf: [320]u8 = undefined;
         const ssid = m.active_ssid orelse "Wi-Fi";
-        const text: []const u8 = switch (m.status) {
+        const wifi_text: []const u8 = switch (m.status) {
             .connected => std.fmt.bufPrint(&buf, "Connected to {s} ({d}%)", .{ ssid, m.active_strength }) catch "Connected",
             .connecting => std.fmt.bufPrint(&buf, "Connecting to {s}\u{2026}", .{ssid}) catch "Connecting",
             .disconnected => "Not connected",
             .disabled => "Wi-Fi is off",
             .no_device => "No Wi-Fi device",
         };
+        var full: [512]u8 = undefined;
+        const text: []const u8 = if (m.vpn_on) |vpn|
+            std.fmt.bufPrint(&full, "{s}\nVPN: {s}", .{ wifi_text, vpn }) catch wifi_text
+        else
+            wifi_text;
         app.tray.setTooltip("Wi-Fi", text) catch |err| log.warn("cannot update the tooltip: {t}", .{err});
     }
 
-    fn renderIcons(app: *App, bars: u8, look: icon.Look) ![]sni.Pixmap {
+    fn renderIcons(app: *App, bars: u8, look: icon.Look, vpn_badge: bool) ![]sni.Pixmap {
         const sizes = [_]u32{ 16, 22, 24, 32, 48 };
         const pixmaps = try app.gpa.alloc(sni.Pixmap, sizes.len);
         var done: usize = 0;
@@ -91,7 +101,7 @@ const App = struct {
             app.gpa.free(pixmaps);
         }
         for (sizes, 0..) |size, i| {
-            pixmaps[i] = .{ .size = size, .data = try icon.renderTrayPixmap(app.gpa, size, bars, look) };
+            pixmaps[i] = .{ .size = size, .data = try icon.renderTrayPixmap(app.gpa, size, bars, look, app.theme.tray, vpn_badge) };
             done += 1;
         }
         return pixmaps;
@@ -101,6 +111,16 @@ const App = struct {
 
     fn onActivate(ctx: ?*anyopaque) void {
         fromCtx(ctx).ui.toggle();
+    }
+
+    // ---- secret agent -> popup --------------------------------------------
+
+    fn onAgentRequest(ctx: ?*anyopaque, req: *agent.Request) void {
+        fromCtx(ctx).ui.showAgentPrompt(req);
+    }
+
+    fn onAgentCancel(ctx: ?*anyopaque, req: *agent.Request) void {
+        fromCtx(ctx).ui.agentRequestCancelled(req);
     }
 
     /// Right click on the tray icon quits wayman.
@@ -206,8 +226,70 @@ const App = struct {
     }
 };
 
+const usage =
+    \\Usage: wayman [options]
+    \\
+    \\A Wi-Fi tray icon and popup for sway and other wlroots compositors.
+    \\
+    \\Options:
+    \\  --style PATH       Load colours and fonts from this CSS file
+    \\                     (same subset as waybar's style.css).
+    \\  --no-waybar-theme  Use the built-in theme instead of waybar's.
+    \\  -h, --help         Show this help.
+    \\  --version          Show the version.
+    \\
+;
+
+const Options = struct {
+    style: ?[]const u8 = null,
+    use_waybar_theme: bool = true,
+};
+
+fn parseArgs(args: std.process.Args) !Options {
+    var opts: Options = .{};
+    var it = args.iterate();
+    _ = it.next();
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            std.debug.print("{s}", .{usage});
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            std.debug.print("wayman 0.1.0\n", .{});
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--no-waybar-theme")) {
+            opts.use_waybar_theme = false;
+        } else if (std.mem.startsWith(u8, arg, "--style=")) {
+            opts.style = arg["--style=".len..];
+        } else if (std.mem.eql(u8, arg, "--style")) {
+            opts.style = it.next() orelse {
+                std.debug.print("--style needs a path\n{s}", .{usage});
+                std.process.exit(2);
+            };
+        } else {
+            std.debug.print("unknown option: {s}\n{s}", .{ arg, usage });
+            std.process.exit(2);
+        }
+    }
+    return opts;
+}
+
+fn loadTheme(gpa: std.mem.Allocator, init: std.process.Init, opts: Options) !Theme {
+    if (opts.style) |path| {
+        return Theme.fromCssFile(gpa, init.io, path) catch |err| {
+            log.err("cannot load the stylesheet {s}: {t}", .{ path, err });
+            return err;
+        };
+    }
+    if (opts.use_waybar_theme) {
+        if (try Theme.fromWaybar(gpa, init.io, init.environ_map)) |t| return t;
+        log.info("no waybar stylesheet found; using the built-in theme", .{});
+    }
+    return Theme.builtin;
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
+    const opts = try parseArgs(init.minimal.args);
     const app = try gpa.create(App);
     defer gpa.destroy(app);
     app.* = .{
@@ -218,7 +300,10 @@ pub fn main(init: std.process.Init) !void {
         .nm = undefined,
         .tray = undefined,
         .ui = undefined,
+        .agent = undefined,
+        .theme = try loadTheme(gpa, init, opts),
     };
+    defer app.theme.deinit(gpa);
 
     app.system = try dbus.Connection.open(.system);
     defer app.system.close();
@@ -247,7 +332,13 @@ pub fn main(init: std.process.Init) !void {
     defer app.tray.deinit();
     app.tray.on_context_menu = App.onContextMenu;
 
-    app.ui.init(gpa, &app.wl, &app.nm);
+    try app.agent.init(gpa, app.system);
+    defer app.agent.deinit();
+    app.agent.on_request = App.onAgentRequest;
+    app.agent.on_cancel = App.onAgentCancel;
+    app.agent.ctx = app;
+
+    app.ui.init(gpa, &app.wl, &app.nm, &app.agent, app.theme);
     defer app.ui.deinit();
 
     app.nm.refresh();
@@ -259,4 +350,6 @@ test {
     std.testing.refAllDecls(@This());
     _ = nm;
     _ = icon;
+    _ = @import("theme.zig");
+    _ = agent;
 }

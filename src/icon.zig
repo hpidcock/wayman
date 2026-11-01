@@ -89,7 +89,7 @@ pub const Look = enum { off, disconnected, connecting, connected };
 
 /// A tray pixmap in the StatusNotifierItem format: ARGB32, network byte
 /// order, non-premultiplied. Caller owns the returned bytes.
-pub fn renderTrayPixmap(gpa: std.mem.Allocator, size: u32, bars: u8, look: Look) ![]u8 {
+pub fn renderTrayPixmap(gpa: std.mem.Allocator, size: u32, bars: u8, look: Look, color: Color, vpn_badge: bool) ![]u8 {
     const surface = c.cairo_image_surface_create(c.CAIRO_FORMAT_ARGB32, @intCast(size), @intCast(size)) orelse return error.OutOfMemory;
     defer c.cairo_surface_destroy(surface);
     const cr = c.cairo_create(surface) orelse return error.OutOfMemory;
@@ -100,7 +100,7 @@ pub fn renderTrayPixmap(gpa: std.mem.Allocator, size: u32, bars: u8, look: Look)
     c.cairo_paint(cr);
     c.cairo_set_operator(cr, c.CAIRO_OPERATOR_OVER);
 
-    const white = Color.rgb(0xffffff);
+    const white = color.withAlpha(1.0);
     const fs: f64 = @floatFromInt(size);
     const inset = fs * 0.08;
     const box = fs - 2.0 * inset;
@@ -112,6 +112,17 @@ pub fn renderTrayPixmap(gpa: std.mem.Allocator, size: u32, bars: u8, look: Look)
             drawBars(cr, inset, inset, box, 0, white, white.withAlpha(0.25));
             drawStrike(cr, inset, inset, box, white.withAlpha(0.9));
         },
+    }
+    if (vpn_badge) {
+        // A small padlock in the bottom-right corner, punched out of the bars.
+        const badge = fs * 0.5;
+        const bx = fs - badge;
+        const by = fs - badge;
+        c.cairo_set_operator(cr, c.CAIRO_OPERATOR_CLEAR);
+        c.cairo_arc(cr, bx + badge / 2.0, by + badge / 2.0, badge * 0.62, 0, 2.0 * std.math.pi);
+        c.cairo_fill(cr);
+        c.cairo_set_operator(cr, c.CAIRO_OPERATOR_OVER);
+        drawLock(cr, bx, by, badge, white);
     }
     c.cairo_surface_flush(surface);
 
@@ -146,7 +157,7 @@ pub fn renderTrayPixmap(gpa: std.mem.Allocator, size: u32, bars: u8, look: Look)
 }
 
 test "tray pixmap has the expected size and opaque bars" {
-    const px = try renderTrayPixmap(std.testing.allocator, 22, 4, .connected);
+    const px = try renderTrayPixmap(std.testing.allocator, 22, 4, .connected, Color.rgb(0xffffff), false);
     defer std.testing.allocator.free(px);
     try std.testing.expectEqual(@as(usize, 22 * 22 * 4), px.len);
     // The bottom-left corner of the first bar is opaque white.

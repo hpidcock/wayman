@@ -21,6 +21,7 @@ const device_iface = nm_iface ++ ".Device";
 const wireless_iface = nm_iface ++ ".Device.Wireless";
 const ap_iface = nm_iface ++ ".AccessPoint";
 const active_iface = nm_iface ++ ".Connection.Active";
+const settings_path = nm_path ++ "/Settings";
 const settings_iface = nm_iface ++ ".Settings";
 const settings_conn_iface = settings_iface ++ ".Connection";
 
@@ -137,6 +138,26 @@ pub const Network = struct {
 
 pub const Status = enum { no_device, disabled, disconnected, connecting, connected };
 
+pub const VpnState = enum { off, connecting, on, disconnecting };
+
+/// A VPN profile (NetworkManager type `vpn` or `wireguard`).
+pub const Vpn = struct {
+    id: [:0]const u8,
+    uuid: [:0]const u8,
+    /// Settings connection path.
+    path: [:0]const u8,
+    wireguard: bool,
+    state: VpnState,
+    /// Active connection path while connecting, on or disconnecting.
+    active_path: ?[:0]const u8,
+};
+
+/// NMActiveConnectionStateReason values.
+const active_reason_user_disconnected: u32 = 2;
+const active_reason_connect_timeout: u32 = 6;
+const active_reason_no_secrets: u32 = 9;
+const active_reason_login_failed: u32 = 10;
+
 pub const Model = struct {
     status: Status = .no_device,
     wireless_enabled: bool = false,
@@ -144,6 +165,10 @@ pub const Model = struct {
     active_ssid: ?[:0]const u8 = null,
     active_strength: u8 = 0,
     networks: []Network = &.{},
+    vpns: []Vpn = &.{},
+    /// Name of the first VPN that is fully connected.
+    vpn_on: ?[:0]const u8 = null,
+    vpn_on_count: usize = 0,
 };
 
 const Pending = struct {
@@ -151,6 +176,11 @@ const Pending = struct {
     /// Set when the profile was created by this attempt and should be
     /// removed again if authentication fails.
     added_path: ?[:0]u8,
+};
+
+const PendingVpn = struct {
+    id: [:0]u8,
+    active_path: [:0]u8,
 };
 
 pub const ChangeFn = *const fn (?*anyopaque) void;
@@ -165,6 +195,10 @@ pub const Client = struct {
     dirty: bool = true,
     dirty_since_ms: i64 = 0,
     pending: ?Pending = null,
+    pending_vpn: ?PendingVpn = null,
+    /// Set when the user cancelled a secret prompt, so the resulting
+    /// activation failure is not reported as an error.
+    suppress_vpn_failure: bool = false,
     /// A profile to delete from the main loop (set by the signal filter).
     cleanup_path: ?[:0]u8 = null,
     last_error: ?[]u8 = null,
@@ -186,6 +220,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.clearPending();
+        self.clearPendingVpn();
         if (self.device_path) |p| self.gpa.free(p);
         if (self.cleanup_path) |p| self.gpa.free(p);
         if (self.last_error) |e| self.gpa.free(e);
@@ -259,6 +294,20 @@ pub const Client = struct {
         }
     }
 
+    fn clearPendingVpn(self: *Client) void {
+        if (self.pending_vpn) |p| {
+            self.gpa.free(p.id);
+            self.gpa.free(p.active_path);
+            self.pending_vpn = null;
+        }
+    }
+
+    /// The user cancelled a credentials prompt; the activation that is
+    /// about to fail because of it should not be reported.
+    pub fn suppressNextVpnFailure(self: *Client) void {
+        if (self.pending_vpn != null) self.suppress_vpn_failure = true;
+    }
+
     // ---- signal handling -------------------------------------------------
 
     fn filter(_: ?*c.DBusConnection, msg_opt: ?*c.DBusMessage, data: ?*anyopaque) callconv(.c) c.DBusHandlerResult {
@@ -298,6 +347,13 @@ pub const Client = struct {
                 }
             }
             self.markDirty(now);
+        } else if (std.mem.eql(u8, iface, active_iface) and std.mem.eql(u8, member, "StateChanged")) {
+            var r = dbus.Reader.init(msg);
+            const state = r.uint32() catch return;
+            _ = r.next();
+            const reason = r.uint32() catch return;
+            self.onActiveState(path, state, reason);
+            self.markDirty(now);
         } else if (std.mem.eql(u8, iface, wireless_iface)) {
             self.markDirty(now);
         } else if (std.mem.eql(u8, iface, nm_iface)) {
@@ -331,6 +387,28 @@ pub const Client = struct {
                 self.pending.?.added_path = null;
             }
             self.clearPending();
+        }
+    }
+
+    fn onActiveState(self: *Client, path: []const u8, state: u32, reason: u32) void {
+        const pending = self.pending_vpn orelse return;
+        if (!std.mem.eql(u8, pending.active_path, path)) return;
+        if (state == 2) {
+            self.clearPendingVpn();
+            self.suppress_vpn_failure = false;
+            self.setError(null);
+        } else if (state == 4) {
+            log.info("VPN {s} deactivated (reason {d})", .{ pending.id, reason });
+            if (self.suppress_vpn_failure) {
+                self.suppress_vpn_failure = false;
+            } else switch (reason) {
+                active_reason_user_disconnected => {},
+                active_reason_no_secrets => self.setErrorFmt("{s} needs credentials", .{pending.id}),
+                active_reason_login_failed => self.setErrorFmt("Login to {s} failed", .{pending.id}),
+                active_reason_connect_timeout => self.setErrorFmt("Connecting to {s} timed out", .{pending.id}),
+                else => self.setErrorFmt("Couldn't connect {s}", .{pending.id}),
+            }
+            self.clearPendingVpn();
         }
     }
 
@@ -476,6 +554,8 @@ pub const Client = struct {
         std.mem.sort(Network, networks.items, {}, networkLessThan);
         m.networks = networks.items;
 
+        try self.readVpns(a, &m);
+
         m.status = if (!m.wireless_enabled)
             .disabled
         else if (m.device_state == DeviceState.activated)
@@ -485,6 +565,110 @@ pub const Client = struct {
         else
             .disconnected;
         self.model = m;
+    }
+
+    const ActiveInfo = struct { path: [:0]const u8, state: u32 };
+
+    /// Fills `m.vpns` from every `vpn`/`wireguard` profile and the list of
+    /// active connections.
+    fn readVpns(self: *Client, a: Allocator, m: *Model) !void {
+        var active: std.StringHashMapUnmanaged(ActiveInfo) = .empty;
+        {
+            const reply = try dbus.getProperty(self.conn, dest, nm_path, nm_iface, "ActiveConnections");
+            defer reply.deinit();
+            var r = reply.reader();
+            var v = try r.variant();
+            var paths = try v.stringArray();
+            while (paths.next()) |p| {
+                const active_path = try a.dupeSentinel(u8, p, 0);
+                const info = dbus.getAllProperties(self.conn, dest, active_path, active_iface) catch continue;
+                defer info.deinit();
+                var ir = info.reader();
+                var it = ir.dict() catch continue;
+                var conn_path: ?[:0]const u8 = null;
+                var state: u32 = 0;
+                while (it.next()) |entry| {
+                    var ev = entry.value;
+                    var val = ev.variant() catch continue;
+                    if (std.mem.eql(u8, entry.key, "Connection")) {
+                        conn_path = try a.dupeSentinel(u8, val.string() catch continue, 0);
+                    } else if (std.mem.eql(u8, entry.key, "State")) {
+                        state = val.uint32() catch 0;
+                    }
+                }
+                if (conn_path) |cp| try active.put(a, cp, .{ .path = active_path, .state = state });
+            }
+        }
+
+        var vpns: std.ArrayList(Vpn) = .empty;
+        {
+            const msg = try dbus.Message.methodCall(dest, settings_path, settings_iface, "ListConnections");
+            const reply = try self.conn.call(msg, 5000);
+            defer reply.deinit();
+            var r = reply.reader();
+            var paths = try r.stringArray();
+            while (paths.next()) |p| {
+                const path = try a.dupeSentinel(u8, p, 0);
+                const profile = self.readProfile(a, path) catch continue;
+                const wireguard = std.mem.eql(u8, profile.kind, "wireguard");
+                if (!wireguard and !std.mem.eql(u8, profile.kind, "vpn")) continue;
+                const act = active.get(path);
+                try vpns.append(a, .{
+                    .id = profile.id,
+                    .uuid = profile.uuid,
+                    .path = path,
+                    .wireguard = wireguard,
+                    .state = if (act) |x| switch (x.state) {
+                        1 => .connecting,
+                        2 => .on,
+                        3 => .disconnecting,
+                        else => .off,
+                    } else .off,
+                    .active_path = if (act) |x| x.path else null,
+                });
+            }
+        }
+        std.mem.sort(Vpn, vpns.items, {}, vpnLessThan);
+        m.vpns = vpns.items;
+        for (vpns.items) |v| {
+            if (v.state == .on) {
+                m.vpn_on_count += 1;
+                if (m.vpn_on == null) m.vpn_on = v.id;
+            }
+        }
+    }
+
+    fn vpnLessThan(_: void, lhs: Vpn, rhs: Vpn) bool {
+        return std.ascii.lessThanIgnoreCase(lhs.id, rhs.id);
+    }
+
+    const Profile = struct { kind: []const u8, id: [:0]const u8, uuid: [:0]const u8 };
+
+    /// The `connection` section of a profile.
+    fn readProfile(self: *Client, a: Allocator, conn_path: [:0]const u8) !Profile {
+        const msg = try dbus.Message.methodCall(dest, conn_path, settings_conn_iface, "GetSettings");
+        const reply = try self.conn.call(msg, 5000);
+        defer reply.deinit();
+        var profile: Profile = .{ .kind = "", .id = "", .uuid = "" };
+        var r = reply.reader();
+        var sections = try r.dict();
+        while (sections.next()) |section| {
+            if (!std.mem.eql(u8, section.key, "connection")) continue;
+            var sv = section.value;
+            var props = try sv.dict();
+            while (props.next()) |prop| {
+                var pv = prop.value;
+                var val = pv.variant() catch continue;
+                if (std.mem.eql(u8, prop.key, "type")) {
+                    profile.kind = try a.dupe(u8, val.string() catch continue);
+                } else if (std.mem.eql(u8, prop.key, "id")) {
+                    profile.id = try a.dupeSentinel(u8, val.string() catch continue, 0);
+                } else if (std.mem.eql(u8, prop.key, "uuid")) {
+                    profile.uuid = try a.dupeSentinel(u8, val.string() catch continue, 0);
+                }
+            }
+        }
+        return profile;
     }
 
     fn networkLessThan(_: void, lhs: Network, rhs: Network) bool {
@@ -669,6 +853,43 @@ pub const Client = struct {
         const msg = try dbus.Message.methodCall(dest, nm_path, nm_iface, "DeactivateConnection");
         var w = msg.writer();
         w.objectPath(active);
+        const reply = try self.conn.call(msg, 15000);
+        reply.deinit();
+        self.markDirty(nowMs());
+    }
+
+    /// Activate a VPN profile; NetworkManager picks the device.
+    pub fn vpnConnect(self: *Client, index: usize) !void {
+        if (index >= self.model.vpns.len) return error.UnknownVpn;
+        const vpn = self.model.vpns[index];
+        self.clearPendingVpn();
+        self.suppress_vpn_failure = false;
+        self.setError(null);
+        log.info("activating VPN {s}", .{vpn.id});
+        const msg = try dbus.Message.methodCall(dest, nm_path, nm_iface, "ActivateConnection");
+        var w = msg.writer();
+        w.objectPath(vpn.path);
+        w.objectPath("/");
+        w.objectPath("/");
+        const reply = try self.conn.call(msg, 15000);
+        defer reply.deinit();
+        var r = reply.reader();
+        const active_path = try r.string();
+        const id = try self.gpa.dupeSentinel(u8, vpn.id, 0);
+        errdefer self.gpa.free(id);
+        self.pending_vpn = .{ .id = id, .active_path = try self.gpa.dupeSentinel(u8, active_path, 0) };
+        self.markDirty(nowMs());
+    }
+
+    pub fn vpnDisconnect(self: *Client, index: usize) !void {
+        if (index >= self.model.vpns.len) return error.UnknownVpn;
+        const vpn = self.model.vpns[index];
+        const active_path = vpn.active_path orelse return;
+        self.clearPendingVpn();
+        log.info("deactivating VPN {s}", .{vpn.id});
+        const msg = try dbus.Message.methodCall(dest, nm_path, nm_iface, "DeactivateConnection");
+        var w = msg.writer();
+        w.objectPath(active_path);
         const reply = try self.conn.call(msg, 15000);
         reply.deinit();
         self.markDirty(nowMs());
