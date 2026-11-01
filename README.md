@@ -49,6 +49,15 @@ for switching networks, joining new ones and disconnecting.
   Secure Core. The modulus signature from `/auth/info` is not verified
   (TLS protects the transport).
 
+- **Captive portals**: after each Wi-Fi connection wayman fetches
+  http://captive.apple.com without following redirects. Anything but the
+  expected "Success" page means a portal; the default browser is opened on
+  that URL once per network (`$BROWSER` if set, otherwise `xdg-open`), the
+  popup shows an "Open sign-in page" button under the network, and the
+  tooltip says a sign-in is needed. The probe repeats every 30 s until the
+  network is open, then every 10 minutes. `WAYMAN_PORTAL_URL` overrides the
+  probe URL for testing.
+
 Supported networks: open, WPA2/WPA3 personal, OWE. Enterprise (802.1X) and
 WEP networks are listed but need a profile created with netplan or `nmcli`
 first; once one exists wayman can activate it.
@@ -116,6 +125,7 @@ wayman --no-waybar-theme   # built-in theme
 | `src/ui.zig`   | Popup layout, drawing and interaction                       |
 | `src/icon.zig` | Cairo drawing helpers and tray pixmap rendering             |
 | `src/agent.zig`| NetworkManager secret agent (VPN and Wi-Fi credential prompts) |
+| `src/portal.zig` | Captive portal probe and browser launcher                 |
 | `src/proton.zig` | Proton VPN controller: session, worker thread, server choice |
 | `src/proton/api.zig` | HTTPS client for the Proton REST API                 |
 | `src/proton/srp.zig` | Proton's SRP login maths (bcrypt + PMHash)            |

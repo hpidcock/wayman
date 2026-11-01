@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/wait.h>
 #include <linux/input-event-codes.h>
 
 #include <wayland-client.h>

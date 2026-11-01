@@ -11,6 +11,7 @@ const nm = @import("nm.zig");
 const icon = @import("icon.zig");
 const agent = @import("agent.zig");
 const proton = @import("proton.zig");
+const portal = @import("portal.zig");
 const Theme = @import("theme.zig").Theme;
 
 const log = std.log.scoped(.ui);
@@ -48,6 +49,7 @@ const HitKind = enum {
     proton_2fa,
     country,
     picker_back,
+    portal_open,
 };
 
 const Hit = struct {
@@ -106,6 +108,7 @@ pub const Ui = struct {
     nm: *nm.Client,
     agent: *agent.Agent,
     proton: *proton.Client,
+    portal: *portal.Detector,
     theme: Theme,
     open: bool = false,
     needs_redraw: bool = false,
@@ -119,8 +122,8 @@ pub const Ui = struct {
     /// The country picker replaces the list while open.
     picker: bool = false,
 
-    pub fn init(self: *Ui, gpa: Allocator, wl_client: *wl.Client, nm_client: *nm.Client, agent_client: *agent.Agent, proton_client: *proton.Client, theme: Theme) void {
-        self.* = .{ .gpa = gpa, .wl = wl_client, .nm = nm_client, .agent = agent_client, .proton = proton_client, .theme = theme };
+    pub fn init(self: *Ui, gpa: Allocator, wl_client: *wl.Client, nm_client: *nm.Client, agent_client: *agent.Agent, proton_client: *proton.Client, portal_detector: *portal.Detector, theme: Theme) void {
+        self.* = .{ .gpa = gpa, .wl = wl_client, .nm = nm_client, .agent = agent_client, .proton = proton_client, .portal = portal_detector, .theme = theme };
     }
 
     pub fn deinit(self: *Ui) void {
@@ -349,6 +352,7 @@ pub const Ui = struct {
             list = message_h;
             if (m.status != .disabled and m.status != .no_device and m.networks.len > 0) {
                 list = @as(f64, @floatFromInt(m.networks.len)) * row_h;
+                if (self.portal.blocked()) list += row_h;
                 if (self.prompt) |p| {
                     if (p.kind == .wifi) list += entry_h;
                 }
@@ -560,6 +564,7 @@ pub const Ui = struct {
                     .disconnecting => {},
                 }
             },
+            .portal_open => self.portal.openBrowser(),
             .proton_sign_in => self.startProtonLogin(),
             .proton_2fa => self.startProton2fa(),
             .proton_sign_out => self.proton.logout(),
@@ -653,6 +658,10 @@ pub const Ui = struct {
                         for (m.networks, 0..) |net, i| {
                             self.drawRow(cr, w, y, i, net, m.status);
                             y += row_h;
+                            if (net.active and m.status == .connected and self.portal.blocked()) {
+                                self.drawPortalRow(cr, w, y);
+                                y += row_h;
+                            }
                             if (self.prompt) |p| {
                                 if (p.kind == .wifi and std.mem.eql(u8, p.kind.wifi, net.ssid)) {
                                     self.drawWifiPrompt(cr, w, y, p);
@@ -748,6 +757,8 @@ pub const Ui = struct {
 
     fn drawRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, index: usize, net: nm.Network, status: nm.Status) void {
         if (!net.active) self.hoverRow(cr, w, y, row_h, .row, index);
+        // Registered first so the buttons drawn on top win the hit test.
+        self.addHit(.{ .kind = .row, .index = index, .x = 0, .y = y, .w = w, .h = row_h });
 
         const icon_size: f64 = 20;
         const iy = y + (row_h - icon_size) / 2;
@@ -781,8 +792,6 @@ pub const Ui = struct {
         const font = if (net.active) self.theme.font_bold else self.theme.font_regular;
         const name_color = if (net.active) self.theme.accent else self.theme.text;
         _ = drawText(cr, name_x, cy, net.ssid, font, name_color, right - name_x - 6);
-
-        self.addHit(.{ .kind = .row, .index = index, .x = 0, .y = y, .w = w, .h = row_h });
     }
 
     /// A row with a lock icon, a name, an optional status and a switch.
@@ -803,6 +812,15 @@ pub const Ui = struct {
         const font = if (on) self.theme.font_bold else self.theme.font_regular;
         _ = drawText(cr, name_x, cy, name, font, if (on) self.theme.accent else self.theme.text, right - name_x - 6);
         self.addHit(.{ .kind = kind, .index = index, .x = 0, .y = y, .w = w, .h = row_h });
+    }
+
+    /// Shown under the connected network while a captive portal blocks it.
+    fn drawPortalRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64) void {
+        const cy = y + row_h / 2;
+        var right = w - pad;
+        right -= self.drawButton(cr, "Open sign-in page", right, cy, true, .portal_open, 0) + 10;
+        const x = pad + 32;
+        _ = drawText(cr, x, cy, "This network needs a sign-in", self.theme.font_small, self.theme.danger, right - x - 6);
     }
 
     fn drawVpnRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, index: usize, vpn: nm.Vpn) void {

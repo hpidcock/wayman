@@ -15,6 +15,7 @@ const ui = @import("ui.zig");
 const icon = @import("icon.zig");
 const agent = @import("agent.zig");
 const proton = @import("proton.zig");
+const portal = @import("portal.zig");
 const Theme = @import("theme.zig").Theme;
 
 const log = std.log.scoped(.wayman);
@@ -36,6 +37,7 @@ const App = struct {
     ui: ui.Ui,
     agent: agent.Agent,
     proton: proton.Client,
+    portal: portal.Detector,
     theme: Theme,
     next_scan_ms: i64 = 0,
     icon_key: u32 = std.math.maxInt(u32),
@@ -52,6 +54,14 @@ const App = struct {
     // ---- NetworkManager -> tray -------------------------------------------
 
     fn onNmChange(ctx: ?*anyopaque) void {
+        const app = fromCtx(ctx);
+        const m = app.nm.model;
+        app.portal.onNetwork(if (m.status == .connected) m.active_ssid else null, nm.nowMs());
+        app.updateTray();
+        app.ui.onModelChanged();
+    }
+
+    fn onPortalChange(ctx: ?*anyopaque) void {
         const app = fromCtx(ctx);
         app.updateTray();
         app.ui.onModelChanged();
@@ -80,7 +90,10 @@ const App = struct {
         var buf: [320]u8 = undefined;
         const ssid = m.active_ssid orelse "Wi-Fi";
         const wifi_text: []const u8 = switch (m.status) {
-            .connected => std.fmt.bufPrint(&buf, "Connected to {s} ({d}%)", .{ ssid, m.active_strength }) catch "Connected",
+            .connected => if (app.portal.blocked())
+                std.fmt.bufPrint(&buf, "{s} needs a sign-in ({d}%)", .{ ssid, m.active_strength }) catch "Sign-in needed"
+            else
+                std.fmt.bufPrint(&buf, "Connected to {s} ({d}%)", .{ ssid, m.active_strength }) catch "Connected",
             .connecting => std.fmt.bufPrint(&buf, "Connecting to {s}\u{2026}", .{ssid}) catch "Connecting",
             .disconnected => "Not connected",
             .disabled => "Wi-Fi is off",
@@ -178,12 +191,14 @@ const App = struct {
             .{ .fd = try app.system.fd(), .events = POLL.IN, .revents = 0 },
             .{ .fd = try app.session.fd(), .events = POLL.IN, .revents = 0 },
             .{ .fd = app.proton.fd(), .events = POLL.IN, .revents = 0 },
+            .{ .fd = app.portal.fd(), .events = POLL.IN, .revents = 0 },
         };
 
         while (true) {
             const now = nm.nowMs();
             // Deferred NetworkManager work: coalesced refreshes, cleanups.
             app.nm.poll(now);
+            app.portal.poll(now);
             if (app.ui.open and now >= app.next_scan_ms) {
                 app.nm.requestScan();
                 app.next_scan_ms = now + scan_interval_ms;
@@ -194,6 +209,10 @@ const App = struct {
 
             var timeout: i32 = -1;
             if (app.nm.nextDeadline(now)) |d| timeout = @intCast(@min(d, std.math.maxInt(i32)));
+            if (app.portal.nextDeadline(now)) |d| {
+                const until: i32 = @intCast(@min(d, std.math.maxInt(i32)));
+                timeout = if (timeout < 0) until else @min(timeout, until);
+            }
             if (app.ui.open) {
                 const until_scan: i32 = @intCast(@max(0, @min(app.next_scan_ms - now, std.math.maxInt(i32))));
                 timeout = if (timeout < 0) until_scan else @min(timeout, until_scan);
@@ -217,6 +236,7 @@ const App = struct {
             app.system.dispatch();
             app.session.dispatch();
             if ((fds[3].revents & POLL.IN) != 0) app.proton.poll();
+            if ((fds[4].revents & POLL.IN) != 0) app.portal.poll(nm.nowMs());
             if (app.quit) {
                 app.ui.close();
                 app.session.flush();
@@ -331,6 +351,7 @@ pub fn main(init: std.process.Init) !void {
         .ui = undefined,
         .agent = undefined,
         .proton = undefined,
+        .portal = undefined,
         .theme = try loadTheme(gpa, init, opts),
     };
     defer app.theme.deinit(gpa);
@@ -373,7 +394,12 @@ pub fn main(init: std.process.Init) !void {
     app.proton.on_change = App.onProtonChange;
     app.proton.on_change_ctx = app;
 
-    app.ui.init(gpa, &app.wl, &app.nm, &app.agent, &app.proton, app.theme);
+    try app.portal.init(gpa, init.io, init.environ_map);
+    defer app.portal.deinit();
+    app.portal.on_change = App.onPortalChange;
+    app.portal.on_change_ctx = app;
+
+    app.ui.init(gpa, &app.wl, &app.nm, &app.agent, &app.proton, &app.portal, app.theme);
     defer app.ui.deinit();
 
     app.nm.refresh();
@@ -388,4 +414,5 @@ test {
     _ = @import("theme.zig");
     _ = agent;
     _ = proton;
+    _ = portal;
 }
