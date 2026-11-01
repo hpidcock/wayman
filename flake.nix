@@ -4,7 +4,7 @@
   description = "wayman - a sway/wayland tray utility for connecting to and switching wifi networks";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/02c087f3fe673c9e317f206a627cb6b910336dbe";
   };
 
   outputs = { self, nixpkgs }:

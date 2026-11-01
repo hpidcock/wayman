@@ -380,12 +380,13 @@ fn runClockStatus(init: std.process.Init, fmt_text: []const u8) !void {
     var td_fd: ?std.posix.fd_t = null;
     const sys = dbus.Connection.open(.system) catch null;
     if (sys) |conn| {
-        td = undefined;
-        if (td.?.init(gpa, conn)) {
+        // Initialise into a plain value first: unwrapping an optional that
+        // was assigned `undefined` reads an undefined null tag.
+        var tmp: clock.Timedate = undefined;
+        if (tmp.init(gpa, conn)) {
+            td = tmp;
             td_fd = conn.fd() catch null;
-        } else |_| {
-            td = null;
-        }
+        } else |_| {}
     }
     defer if (td) |*t| t.deinit();
 
