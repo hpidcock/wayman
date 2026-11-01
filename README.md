@@ -15,7 +15,8 @@ for switching networks, joining new ones and disconnecting.
 - **Popup**: a `wlr-layer-shell` surface anchored below the bar at the top
   right, drawn with cairo and pango. Click the tray icon to open it. Click a
   network to join it, type the password when asked, press Escape or click
-  anywhere outside to close it.
+  anywhere outside to close it. Text fields take Ctrl+V or Shift+Insert
+  from the clipboard and middle-click from the primary selection.
 - **Networking**: NetworkManager over its D-Bus API, using libdbus-1. New
   networks are added with `AddAndActivateConnection`; on Ubuntu,
   NetworkManager's netplan integration persists them as
@@ -32,6 +33,21 @@ for switching networks, joining new ones and disconnecting.
   with a prompt and hands the answer back to NetworkManager. Answers are
   kept in memory for the session so a reconnect does not ask again;
   one-time codes are never reused. Nothing is written to disk.
+
+- **Proton VPN**: built in, no Proton software required. Sign in from the
+  popup (username, password, two-factor code), pick a country or "Fastest",
+  and flip the switch. wayman signs in with Proton's SRP protocol, fetches a
+  WireGuard certificate for a key it generates, downloads the server list,
+  and keeps one NetworkManager `wireguard` profile called "Proton VPN" up to
+  date for the chosen server. The session (tokens and key) lives in
+  `~/.config/wayman/proton.json` (mode 0600) and the reduced server list in
+  `~/.cache/wayman/proton-servers.json`; signing out deletes both the
+  session and the profile. Network calls run on a worker thread so the popup
+  never blocks. The server list comes from the v1 logicals endpoint, which
+  still carries load and score inline (v2 needs Proton's binary scoring
+  library). Not yet covered: NetShield, kill switch, port forwarding,
+  Secure Core. The modulus signature from `/auth/info` is not verified
+  (TLS protects the transport).
 
 Supported networks: open, WPA2/WPA3 personal, OWE. Enterprise (802.1X) and
 WEP networks are listed but need a profile created with netplan or `nmcli`
@@ -59,7 +75,8 @@ Start it from your sway config:
 exec wayman
 ```
 
-and make sure your bar has a tray, e.g. `"modules-right": ["tray", ...]` in
+Only one instance runs at a time (a lock in `$XDG_RUNTIME_DIR`); a second
+one exits with a message. Make sure your bar has a tray, e.g. `"modules-right": ["tray", ...]` in
 waybar. Logs go to stderr; debug builds are more verbose.
 
 ## Theming
@@ -99,6 +116,10 @@ wayman --no-waybar-theme   # built-in theme
 | `src/ui.zig`   | Popup layout, drawing and interaction                       |
 | `src/icon.zig` | Cairo drawing helpers and tray pixmap rendering             |
 | `src/agent.zig`| NetworkManager secret agent (VPN and Wi-Fi credential prompts) |
+| `src/proton.zig` | Proton VPN controller: session, worker thread, server choice |
+| `src/proton/api.zig` | HTTPS client for the Proton REST API                 |
+| `src/proton/srp.zig` | Proton's SRP login maths (bcrypt + PMHash)            |
+| `src/proton/countries.zig` | Country codes to names                          |
 | `src/dbus.zig` | Thin helpers over libdbus-1                                 |
 | `src/theme.zig`| CSS subset parser and the waybar-to-popup theme mapping     |
 | `src/c.h`      | The C headers translated into the `c` module at build time  |

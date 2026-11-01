@@ -862,23 +862,204 @@ pub const Client = struct {
     pub fn vpnConnect(self: *Client, index: usize) !void {
         if (index >= self.model.vpns.len) return error.UnknownVpn;
         const vpn = self.model.vpns[index];
+        try self.activateProfile(vpn.path, vpn.id);
+    }
+
+    /// Activate any profile by settings path, tracking it as a pending VPN.
+    pub fn activateProfile(self: *Client, path: [:0]const u8, id: []const u8) !void {
         self.clearPendingVpn();
         self.suppress_vpn_failure = false;
         self.setError(null);
-        log.info("activating VPN {s}", .{vpn.id});
+        log.info("activating {s}", .{id});
         const msg = try dbus.Message.methodCall(dest, nm_path, nm_iface, "ActivateConnection");
         var w = msg.writer();
-        w.objectPath(vpn.path);
+        w.objectPath(path);
         w.objectPath("/");
         w.objectPath("/");
         const reply = try self.conn.call(msg, 15000);
         defer reply.deinit();
         var r = reply.reader();
         const active_path = try r.string();
-        const id = try self.gpa.dupeSentinel(u8, vpn.id, 0);
-        errdefer self.gpa.free(id);
-        self.pending_vpn = .{ .id = id, .active_path = try self.gpa.dupeSentinel(u8, active_path, 0) };
+        const idz = try self.gpa.dupeSentinel(u8, id, 0);
+        errdefer self.gpa.free(idz);
+        self.pending_vpn = .{ .id = idz, .active_path = try self.gpa.dupeSentinel(u8, active_path, 0) };
         self.markDirty(nowMs());
+    }
+
+    pub fn findVpnByUuid(self: *const Client, uuid: []const u8) ?*const Vpn {
+        for (self.model.vpns) |*v| {
+            if (std.mem.eql(u8, v.uuid, uuid)) return v;
+        }
+        return null;
+    }
+
+    pub fn deactivateByUuid(self: *Client, uuid: []const u8) !void {
+        const vpn = self.findVpnByUuid(uuid) orelse return;
+        const active_path = vpn.active_path orelse return;
+        self.clearPendingVpn();
+        log.info("deactivating {s}", .{vpn.id});
+        const msg = try dbus.Message.methodCall(dest, nm_path, nm_iface, "DeactivateConnection");
+        var w = msg.writer();
+        w.objectPath(active_path);
+        const reply = try self.conn.call(msg, 15000);
+        reply.deinit();
+        self.markDirty(nowMs());
+    }
+
+    fn profilePathByUuid(self: *Client, uuid: [:0]const u8) !?[:0]u8 {
+        const msg = try dbus.Message.methodCall(dest, settings_path, settings_iface, "GetConnectionByUuid");
+        var w = msg.writer();
+        w.string(uuid);
+        const reply = self.conn.call(msg, 5000) catch return null;
+        defer reply.deinit();
+        var r = reply.reader();
+        return try self.gpa.dupeSentinel(u8, try r.string(), 0);
+    }
+
+    pub fn deleteProfileByUuid(self: *Client, uuid: []const u8) !void {
+        const uuidz = try self.gpa.dupeSentinel(u8, uuid, 0);
+        defer self.gpa.free(uuidz);
+        const path = (try self.profilePathByUuid(uuidz)) orelse return;
+        defer self.gpa.free(path);
+        log.info("deleting profile {s}", .{path});
+        const msg = try dbus.Message.methodCall(dest, path, settings_conn_iface, "Delete");
+        const reply = try self.conn.call(msg, 5000);
+        reply.deinit();
+        self.markDirty(nowMs());
+    }
+
+    pub const WireguardProfile = struct {
+        uuid: []const u8,
+        id: []const u8,
+        interface: []const u8,
+        /// Base64 X25519 private key.
+        private_key: []const u8,
+        /// Base64 X25519 public key of the peer.
+        peer_public_key: []const u8,
+        /// `ip:port`.
+        endpoint: []const u8,
+    };
+
+    /// Creates or updates a WireGuard profile that routes everything through
+    /// the peer (address 10.2.0.2/32, DNS 10.2.0.1). Returns its settings path.
+    pub fn ensureWireguardProfile(self: *Client, p: WireguardProfile) ![:0]u8 {
+        const z = struct {
+            fn dup(gpa: Allocator, s: []const u8) ![:0]u8 {
+                return gpa.dupeSentinel(u8, s, 0);
+            }
+        };
+        const uuid = try z.dup(self.gpa, p.uuid);
+        defer self.gpa.free(uuid);
+        const id = try z.dup(self.gpa, p.id);
+        defer self.gpa.free(id);
+        const iface_name = try z.dup(self.gpa, p.interface);
+        defer self.gpa.free(iface_name);
+        const key = try z.dup(self.gpa, p.private_key);
+        defer {
+            @memset(key, 0);
+            self.gpa.free(key);
+        }
+        const peer_key = try z.dup(self.gpa, p.peer_public_key);
+        defer self.gpa.free(peer_key);
+        const endpoint = try z.dup(self.gpa, p.endpoint);
+        defer self.gpa.free(endpoint);
+
+        const existing = try self.profilePathByUuid(uuid);
+        defer if (existing) |e| self.gpa.free(e);
+
+        const msg = if (existing) |path|
+            try dbus.Message.methodCall(dest, path, settings_conn_iface, "Update")
+        else
+            try dbus.Message.methodCall(dest, settings_path, settings_iface, "AddConnection");
+        var w = msg.writer();
+        var settings = w.open(c.DBUS_TYPE_ARRAY, "{sa{sv}}");
+        {
+            var section = settings.open(c.DBUS_TYPE_DICT_ENTRY, null);
+            section.string("connection");
+            var props = section.open(c.DBUS_TYPE_ARRAY, "{sv}");
+            props.dictString("id", id);
+            props.dictString("uuid", uuid);
+            props.dictString("type", "wireguard");
+            props.dictString("interface-name", iface_name);
+            props.dictBool("autoconnect", false);
+            section.close(&props);
+            settings.close(&section);
+        }
+        {
+            var section = settings.open(c.DBUS_TYPE_DICT_ENTRY, null);
+            section.string("wireguard");
+            var props = section.open(c.DBUS_TYPE_ARRAY, "{sv}");
+            props.dictString("private-key", key);
+            var peers_entry = props.open(c.DBUS_TYPE_DICT_ENTRY, null);
+            peers_entry.string("peers");
+            var peers_variant = peers_entry.open(c.DBUS_TYPE_VARIANT, "aa{sv}");
+            var peers = peers_variant.open(c.DBUS_TYPE_ARRAY, "a{sv}");
+            var peer = peers.open(c.DBUS_TYPE_ARRAY, "{sv}");
+            peer.dictString("public-key", peer_key);
+            peer.dictString("endpoint", endpoint);
+            peer.dictStringArray("allowed-ips", &.{"0.0.0.0/0"});
+            peer.dictUint32("persistent-keepalive", 25);
+            peers.close(&peer);
+            peers_variant.close(&peers);
+            peers_entry.close(&peers_variant);
+            props.close(&peers_entry);
+            section.close(&props);
+            settings.close(&section);
+        }
+        {
+            var section = settings.open(c.DBUS_TYPE_DICT_ENTRY, null);
+            section.string("ipv4");
+            var props = section.open(c.DBUS_TYPE_ARRAY, "{sv}");
+            props.dictString("method", "manual");
+            var addr_entry = props.open(c.DBUS_TYPE_DICT_ENTRY, null);
+            addr_entry.string("address-data");
+            var addr_variant = addr_entry.open(c.DBUS_TYPE_VARIANT, "aa{sv}");
+            var addrs = addr_variant.open(c.DBUS_TYPE_ARRAY, "a{sv}");
+            var addr = addrs.open(c.DBUS_TYPE_ARRAY, "{sv}");
+            addr.dictString("address", "10.2.0.2");
+            addr.dictUint32("prefix", 32);
+            addrs.close(&addr);
+            addr_variant.close(&addrs);
+            addr_entry.close(&addr_variant);
+            props.close(&addr_entry);
+            // DNS servers are `au` in the in-memory (native) byte order of
+            // the address bytes, as inet_aton produces them.
+            var dns_entry = props.open(c.DBUS_TYPE_DICT_ENTRY, null);
+            dns_entry.string("dns");
+            var dns_variant = dns_entry.open(c.DBUS_TYPE_VARIANT, "au");
+            var dns = dns_variant.open(c.DBUS_TYPE_ARRAY, "u");
+            dns.uint32(std.mem.readInt(u32, &[4]u8{ 10, 2, 0, 1 }, @import("builtin").cpu.arch.endian()));
+            dns_variant.close(&dns);
+            dns_entry.close(&dns_variant);
+            props.close(&dns_entry);
+            props.dictStringArray("dns-search", &.{"~"});
+            props.dictInt32("dns-priority", -1500);
+            props.dictBool("ignore-auto-dns", true);
+            section.close(&props);
+            settings.close(&section);
+        }
+        {
+            var section = settings.open(c.DBUS_TYPE_DICT_ENTRY, null);
+            section.string("ipv6");
+            var props = section.open(c.DBUS_TYPE_ARRAY, "{sv}");
+            props.dictString("method", "disabled");
+            section.close(&props);
+            settings.close(&section);
+        }
+        w.close(&settings);
+
+        const reply = try self.conn.call(msg, 10000);
+        defer reply.deinit();
+        if (existing) |path| {
+            log.info("updated WireGuard profile {s}", .{path});
+            self.markDirty(nowMs());
+            return try self.gpa.dupeSentinel(u8, path, 0);
+        }
+        var r = reply.reader();
+        const path = try r.string();
+        log.info("created WireGuard profile {s}", .{path});
+        self.markDirty(nowMs());
+        return try self.gpa.dupeSentinel(u8, path, 0);
     }
 
     pub fn vpnDisconnect(self: *Client, index: usize) !void {

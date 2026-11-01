@@ -261,6 +261,43 @@ pub const Writer = struct {
         w.close(&e);
     }
 
+    pub fn dictBool(w: *Writer, key: [*:0]const u8, value: bool) void {
+        var e = w.open(c.DBUS_TYPE_DICT_ENTRY, null);
+        e.string(key);
+        e.variantBool(value);
+        w.close(&e);
+    }
+
+    pub fn dictUint32(w: *Writer, key: [*:0]const u8, value: u32) void {
+        var e = w.open(c.DBUS_TYPE_DICT_ENTRY, null);
+        e.string(key);
+        var v = e.open(c.DBUS_TYPE_VARIANT, "u");
+        v.uint32(value);
+        e.close(&v);
+        w.close(&e);
+    }
+
+    pub fn dictInt32(w: *Writer, key: [*:0]const u8, value: i32) void {
+        var e = w.open(c.DBUS_TYPE_DICT_ENTRY, null);
+        e.string(key);
+        var v = e.open(c.DBUS_TYPE_VARIANT, "i");
+        v.int32(value);
+        e.close(&v);
+        w.close(&e);
+    }
+
+    /// Appends a `{sv}` entry holding an `as`.
+    pub fn dictStringArray(w: *Writer, key: [*:0]const u8, values: []const [*:0]const u8) void {
+        var e = w.open(c.DBUS_TYPE_DICT_ENTRY, null);
+        e.string(key);
+        var v = e.open(c.DBUS_TYPE_VARIANT, "as");
+        var arr = v.open(c.DBUS_TYPE_ARRAY, "s");
+        for (values) |s| arr.string(s);
+        v.close(&arr);
+        e.close(&v);
+        w.close(&e);
+    }
+
     pub fn dictByteArray(w: *Writer, key: [*:0]const u8, bytes: []const u8) void {
         var e = w.open(c.DBUS_TYPE_DICT_ENTRY, null);
         e.string(key);

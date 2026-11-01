@@ -5,12 +5,18 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <linux/input-event-codes.h>
 
 #include <wayland-client.h>
 #include <wayland-cursor.h>
 #include <xdg-shell-client-protocol.h>
 #include <viewporter-client-protocol.h>
+#include <primary-selection-unstable-v1-client-protocol.h>
+#include <poll.h>
 #include <wlr-layer-shell-unstable-v1-client-protocol.h>
 #include <xkbcommon/xkbcommon.h>
 

@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     // Wayland protocols that are not part of libwayland-client itself. Each
     // one is turned into a C header (for translate-c) and a C source file
     // (interface tables) by wayland-scanner at build time.
-    const protocols = [_][]const u8{ "xdg-shell", "viewporter", "wlr-layer-shell-unstable-v1" };
+    const protocols = [_][]const u8{ "xdg-shell", "viewporter", "primary-selection-unstable-v1", "wlr-layer-shell-unstable-v1" };
     const system_libs = [_][]const u8{
         "wayland-client",
         "wayland-cursor",

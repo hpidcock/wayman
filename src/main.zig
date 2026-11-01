@@ -14,6 +14,7 @@ const wl = @import("wl.zig");
 const ui = @import("ui.zig");
 const icon = @import("icon.zig");
 const agent = @import("agent.zig");
+const proton = @import("proton.zig");
 const Theme = @import("theme.zig").Theme;
 
 const log = std.log.scoped(.wayman);
@@ -34,6 +35,7 @@ const App = struct {
     tray: sni.Item,
     ui: ui.Ui,
     agent: agent.Agent,
+    proton: proton.Client,
     theme: Theme,
     next_scan_ms: i64 = 0,
     icon_key: u32 = std.math.maxInt(u32),
@@ -123,6 +125,10 @@ const App = struct {
         fromCtx(ctx).ui.agentRequestCancelled(req);
     }
 
+    fn onProtonChange(ctx: ?*anyopaque) void {
+        fromCtx(ctx).ui.onModelChanged();
+    }
+
     /// Right click on the tray icon quits wayman.
     fn onContextMenu(ctx: ?*anyopaque) void {
         log.info("quit requested from the tray icon", .{});
@@ -171,6 +177,7 @@ const App = struct {
             .{ .fd = app.wl.fd(), .events = POLL.IN, .revents = 0 },
             .{ .fd = try app.system.fd(), .events = POLL.IN, .revents = 0 },
             .{ .fd = try app.session.fd(), .events = POLL.IN, .revents = 0 },
+            .{ .fd = app.proton.fd(), .events = POLL.IN, .revents = 0 },
         };
 
         while (true) {
@@ -209,6 +216,7 @@ const App = struct {
             }
             app.system.dispatch();
             app.session.dispatch();
+            if ((fds[3].revents & POLL.IN) != 0) app.proton.poll();
             if (app.quit) {
                 app.ui.close();
                 app.session.flush();
@@ -287,9 +295,30 @@ fn loadTheme(gpa: std.mem.Allocator, init: std.process.Init, opts: Options) !The
     return Theme.builtin;
 }
 
+/// Holds an exclusive lock so a second wayman cannot run alongside the
+/// first; two instances would fight over the tray item and the Proton
+/// session's single-use refresh token.
+fn acquireInstanceLock(environ: *std.process.Environ.Map) !void {
+    const c = @import("c");
+    const dir = environ.get("XDG_RUNTIME_DIR") orelse "/tmp";
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&buf, "{s}/wayman.lock", .{dir}, 0);
+    const fd = c.open(path, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c_uint, 0o600));
+    if (fd < 0) return error.LockFile;
+    // The descriptor is kept open for the life of the process on purpose.
+    if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) {
+        log.err("wayman is already running (lock held on {s})", .{path});
+        return error.AlreadyRunning;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const opts = try parseArgs(init.minimal.args);
+    acquireInstanceLock(init.environ_map) catch |err| switch (err) {
+        error.AlreadyRunning => std.process.exit(1),
+        else => return err,
+    };
     const app = try gpa.create(App);
     defer gpa.destroy(app);
     app.* = .{
@@ -301,6 +330,7 @@ pub fn main(init: std.process.Init) !void {
         .tray = undefined,
         .ui = undefined,
         .agent = undefined,
+        .proton = undefined,
         .theme = try loadTheme(gpa, init, opts),
     };
     defer app.theme.deinit(gpa);
@@ -338,7 +368,12 @@ pub fn main(init: std.process.Init) !void {
     app.agent.on_cancel = App.onAgentCancel;
     app.agent.ctx = app;
 
-    app.ui.init(gpa, &app.wl, &app.nm, &app.agent, app.theme);
+    try app.proton.init(gpa, init.io, init.environ_map, &app.nm);
+    defer app.proton.deinit();
+    app.proton.on_change = App.onProtonChange;
+    app.proton.on_change_ctx = app;
+
+    app.ui.init(gpa, &app.wl, &app.nm, &app.agent, &app.proton, app.theme);
     defer app.ui.deinit();
 
     app.nm.refresh();
@@ -352,4 +387,5 @@ test {
     _ = icon;
     _ = @import("theme.zig");
     _ = agent;
+    _ = proton;
 }

@@ -2,13 +2,15 @@
 // Licensed under 0BSD, see LICENCE file for details.
 
 //! The popup: Wi-Fi networks with signal strength, a Wi-Fi toggle, a VPN
-//! section with switches, and prompts for passwords and other secrets.
+//! section with switches, a Proton VPN section with sign-in and a country
+//! picker, and prompts for passwords and other secrets.
 const std = @import("std");
 const c = @import("c");
 const wl = @import("wl.zig");
 const nm = @import("nm.zig");
 const icon = @import("icon.zig");
 const agent = @import("agent.zig");
+const proton = @import("proton.zig");
 const Theme = @import("theme.zig").Theme;
 
 const log = std.log.scoped(.ui);
@@ -19,6 +21,7 @@ pub const width: u32 = 380;
 const pad: f64 = 14;
 const header_h: f64 = 54;
 const row_h: f64 = 50;
+const small_row_h: f64 = 36;
 const entry_h: f64 = 60;
 const message_h: f64 = 44;
 const footer_h: f64 = 36;
@@ -28,7 +31,24 @@ const field_row_h: f64 = 44;
 const max_list_h: f64 = 520;
 const corner: f64 = 12;
 
-const HitKind = enum { row, toggle, disconnect, cancel, connect, reveal, field, vpn, prompt_cancel };
+const HitKind = enum {
+    row,
+    toggle,
+    disconnect,
+    cancel,
+    connect,
+    reveal,
+    field,
+    vpn,
+    prompt_cancel,
+    proton_sign_in,
+    proton_toggle,
+    proton_country,
+    proton_sign_out,
+    proton_2fa,
+    country,
+    picker_back,
+};
 
 const Hit = struct {
     kind: HitKind,
@@ -61,12 +81,21 @@ const PromptKind = union(enum) {
     wifi: [:0]u8,
     /// A NetworkManager secret request; drawn under the header.
     agent: *agent.Request,
+    proton_login,
+    proton_2fa,
 };
 
 const Prompt = struct {
     kind: PromptKind,
     fields: []PromptField,
     focus: usize = 0,
+    title: []const u8 = "",
+    message: ?[]const u8 = null,
+    message_danger: bool = false,
+
+    fn isBlock(p: Prompt) bool {
+        return p.kind != .wifi;
+    }
 };
 
 const Point = struct { x: f64, y: f64 };
@@ -76,6 +105,7 @@ pub const Ui = struct {
     wl: *wl.Client,
     nm: *nm.Client,
     agent: *agent.Agent,
+    proton: *proton.Client,
     theme: Theme,
     open: bool = false,
     needs_redraw: bool = false,
@@ -86,9 +116,11 @@ pub const Ui = struct {
     content_h: f64 = 0,
     list_h: f64 = 0,
     prompt: ?Prompt = null,
+    /// The country picker replaces the list while open.
+    picker: bool = false,
 
-    pub fn init(self: *Ui, gpa: Allocator, wl_client: *wl.Client, nm_client: *nm.Client, agent_client: *agent.Agent, theme: Theme) void {
-        self.* = .{ .gpa = gpa, .wl = wl_client, .nm = nm_client, .agent = agent_client, .theme = theme };
+    pub fn init(self: *Ui, gpa: Allocator, wl_client: *wl.Client, nm_client: *nm.Client, agent_client: *agent.Agent, proton_client: *proton.Client, theme: Theme) void {
+        self.* = .{ .gpa = gpa, .wl = wl_client, .nm = nm_client, .agent = agent_client, .proton = proton_client, .theme = theme };
     }
 
     pub fn deinit(self: *Ui) void {
@@ -107,6 +139,7 @@ pub const Ui = struct {
         self.scroll = 0;
         self.hover = null;
         self.pointer = null;
+        self.picker = false;
         const h = self.desiredHeight();
         self.wl.openPopup(width, h) catch |err| {
             log.err("cannot open the popup: {t}", .{err});
@@ -129,6 +162,7 @@ pub const Ui = struct {
         self.open = false;
         self.needs_redraw = false;
         self.cancelPrompt();
+        self.picker = false;
         self.hover = null;
         self.pointer = null;
     }
@@ -149,6 +183,7 @@ pub const Ui = struct {
                 if (net == null or net.?.active) self.clearPrompt();
             }
         }
+        if (self.proton.status == .needs_2fa and self.prompt == null) self.startProton2fa();
         self.relayout();
     }
 
@@ -168,7 +203,13 @@ pub const Ui = struct {
             return;
         };
         for (req.fields, 0..) |f, i| fields[i] = .{ .label = f.label, .masked = f.masked };
-        self.prompt = .{ .kind = .{ .agent = req }, .fields = fields };
+        self.prompt = .{
+            .kind = .{ .agent = req },
+            .fields = fields,
+            .title = req.title,
+            .message = if (req.message) |m| m else if (req.retry) "The previous credentials were rejected" else null,
+            .message_danger = req.retry,
+        };
         if (!self.open) self.openPopup();
         self.relayout();
     }
@@ -190,6 +231,23 @@ pub const Ui = struct {
         };
         fields[0] = .{ .label = "Password", .masked = true };
         self.prompt = .{ .kind = .{ .wifi = copy }, .fields = fields };
+    }
+
+    fn startProtonLogin(self: *Ui) void {
+        self.cancelPrompt();
+        const fields = self.gpa.alloc(PromptField, 2) catch return;
+        fields[0] = .{ .label = "Proton username or email", .masked = false };
+        fields[1] = .{ .label = "Password", .masked = true };
+        self.prompt = .{ .kind = .proton_login, .fields = fields, .title = "Sign in to Proton VPN" };
+        if (self.proton.username().len > 0) fields[0].text.appendSlice(self.gpa, self.proton.username()) catch {};
+        if (fields[0].text.items.len > 0) self.prompt.?.focus = 1;
+    }
+
+    fn startProton2fa(self: *Ui) void {
+        self.cancelPrompt();
+        const fields = self.gpa.alloc(PromptField, 1) catch return;
+        fields[0] = .{ .label = "Two-factor code", .masked = false };
+        self.prompt = .{ .kind = .proton_2fa, .fields = fields, .title = "Proton two-factor authentication", .message = "Enter the code from your authenticator app" };
     }
 
     /// Drops the prompt without answering an agent request.
@@ -217,6 +275,14 @@ pub const Ui = struct {
 
     fn submitPrompt(self: *Ui) void {
         const p = &(self.prompt orelse return);
+        // Every field must be filled; otherwise move the focus to the first empty one.
+        for (p.fields, 0..) |f, i| {
+            if (f.text.items.len == 0) {
+                p.focus = i;
+                self.needs_redraw = true;
+                return;
+            }
+        }
         switch (p.kind) {
             .wifi => |ssid| {
                 const text = p.fields[0].text.items;
@@ -230,52 +296,76 @@ pub const Ui = struct {
                     self.relayout();
                     return;
                 };
-                self.clearPrompt();
             },
             .agent => |req| {
-                for (p.fields, 0..) |f, i| {
-                    if (f.text.items.len == 0) {
-                        p.focus = i;
-                        self.needs_redraw = true;
-                        return;
-                    }
-                }
                 var values: [8][]const u8 = undefined;
                 if (p.fields.len > values.len) return;
                 for (p.fields, 0..) |f, i| values[i] = f.text.items;
                 self.agent.respond(req, values[0..p.fields.len]);
-                self.clearPrompt();
             },
+            .proton_login => self.proton.login(p.fields[0].text.items, p.fields[1].text.items),
+            .proton_2fa => self.proton.twoFactor(p.fields[0].text.items),
         }
+        self.clearPrompt();
         self.relayout();
     }
 
-    fn agentPromptHeight(self: *Ui) f64 {
+    fn promptBlockHeight(self: *Ui) f64 {
         const p = self.prompt orelse return 0;
-        if (p.kind != .agent) return 0;
-        const req = p.kind.agent;
+        if (!p.isBlock()) return 0;
         var h: f64 = 8 + 26;
-        if (req.message != null or req.retry) h += 22;
+        if (p.message != null) h += 22;
         h += @as(f64, @floatFromInt(p.fields.len)) * field_row_h;
         h += 40 + 8;
         return h;
     }
 
+    fn isProtonProfile(self: *Ui, vpn: nm.Vpn) bool {
+        const uuid = self.proton.profileUuid() orelse return false;
+        return std.mem.eql(u8, vpn.uuid, uuid);
+    }
+
+    fn otherVpnCount(self: *Ui) usize {
+        var n: usize = 0;
+        for (self.nm.model.vpns) |v| {
+            if (!self.isProtonProfile(v)) n += 1;
+        }
+        return n;
+    }
+
+    fn protonHeight(self: *Ui) f64 {
+        return section_h + switch (self.proton.status) {
+            .signed_out, .signing_in, .needs_2fa => row_h,
+            .signed_in => row_h + row_h + small_row_h,
+        };
+    }
+
     fn desiredHeight(self: *Ui) u32 {
         const m = self.nm.model;
-        var list: f64 = message_h;
-        if (m.status != .disabled and m.status != .no_device and m.networks.len > 0) {
-            list = @as(f64, @floatFromInt(m.networks.len)) * row_h;
-            if (self.prompt) |p| {
-                if (p.kind == .wifi) list += entry_h;
+        var list: f64 = 0;
+        if (self.picker) {
+            list = small_row_h + @as(f64, @floatFromInt(1 + self.proton.countryList().len)) * row_h;
+        } else {
+            list = message_h;
+            if (m.status != .disabled and m.status != .no_device and m.networks.len > 0) {
+                list = @as(f64, @floatFromInt(m.networks.len)) * row_h;
+                if (self.prompt) |p| {
+                    if (p.kind == .wifi) list += entry_h;
+                }
             }
+            const others = self.otherVpnCount();
+            if (others > 0) list += section_h + @as(f64, @floatFromInt(others)) * row_h;
+            list += self.protonHeight();
         }
-        if (m.vpns.len > 0) list += section_h + @as(f64, @floatFromInt(m.vpns.len)) * row_h;
         self.content_h = list;
         self.list_h = @min(list, max_list_h);
-        var h = header_h + self.agentPromptHeight() + self.list_h + pad / 2;
-        if (self.nm.lastError() != null) h += footer_h;
+        var h = header_h + self.promptBlockHeight() + self.list_h + pad / 2;
+        if (self.footerError() != null) h += footer_h;
         return @intFromFloat(@ceil(h));
+    }
+
+    fn footerError(self: *Ui) ?[]const u8 {
+        return self.nm.lastError() orelse self.proton.lastError();
     }
 
     // ---- input ------------------------------------------------------------
@@ -309,10 +399,38 @@ pub const Ui = struct {
     }
 
     pub fn onPointerButton(self: *Ui, button: u32, pressed: bool) void {
-        if (!pressed or button != c.BTN_LEFT) return;
+        if (!pressed) return;
         const p = self.pointer orelse return;
         const hit = self.hitTest(p.x, p.y) orelse return;
+        log.debug("button {x} on {t}", .{ button, hit.kind });
+        if (button == c.BTN_MIDDLE) {
+            // Middle click pastes the primary selection into a field.
+            if (hit.kind == .field) {
+                if (self.prompt) |*pr| {
+                    if (hit.index < pr.fields.len) pr.focus = hit.index;
+                }
+                self.paste(.primary);
+            }
+            return;
+        }
+        if (button != c.BTN_LEFT) return;
         self.activate(hit);
+    }
+
+    /// Inserts the clipboard or primary selection into the focused field.
+    fn paste(self: *Ui, source: wl.Client.Source) void {
+        const f = self.focusedField() orelse return;
+        const text = self.wl.readSelection(self.gpa, source) orelse return;
+        defer {
+            @memset(text, 0);
+            self.gpa.free(text);
+        }
+        // Drop line breaks and control characters; a trailing newline is
+        // common when copying from a password manager or terminal.
+        for (text) |ch| {
+            if (ch >= 0x20 and ch != 0x7f) f.text.append(self.gpa, ch) catch break;
+        }
+        self.needs_redraw = true;
     }
 
     pub fn onAxis(self: *Ui, dy: f64) void {
@@ -329,6 +447,10 @@ pub const Ui = struct {
             c.XKB_KEY_Escape => {
                 if (self.prompt != null) {
                     self.cancelPrompt();
+                    self.relayout();
+                } else if (self.picker) {
+                    self.picker = false;
+                    self.scroll = 0;
                     self.relayout();
                 } else {
                     self.close();
@@ -354,12 +476,19 @@ pub const Ui = struct {
                     }
                 }
             },
+            c.XKB_KEY_Insert, c.XKB_KEY_KP_Insert => {
+                if (mods.shift) self.paste(.clipboard);
+            },
             else => {
                 const f = self.focusedField() orelse return;
                 if (mods.ctrl) {
-                    if (sym == c.XKB_KEY_u) {
-                        f.text.clearRetainingCapacity();
-                        self.needs_redraw = true;
+                    switch (sym) {
+                        c.XKB_KEY_u => {
+                            f.text.clearRetainingCapacity();
+                            self.needs_redraw = true;
+                        },
+                        c.XKB_KEY_v, c.XKB_KEY_V => self.paste(.clipboard),
+                        else => {},
                     }
                     return;
                 }
@@ -431,6 +560,36 @@ pub const Ui = struct {
                     .disconnecting => {},
                 }
             },
+            .proton_sign_in => self.startProtonLogin(),
+            .proton_2fa => self.startProton2fa(),
+            .proton_sign_out => self.proton.logout(),
+            .proton_toggle => {
+                self.nm.clearError();
+                self.proton.clearError();
+                switch (self.proton.vpnState()) {
+                    .off => self.proton.connect(),
+                    .connecting, .on => self.proton.disconnect(),
+                    .disconnecting => {},
+                }
+            },
+            .proton_country => {
+                self.picker = true;
+                self.scroll = 0;
+            },
+            .picker_back => {
+                self.picker = false;
+                self.scroll = 0;
+            },
+            .country => {
+                const list = self.proton.countryList();
+                if (hit.index == 0) {
+                    self.proton.selectCountry(null);
+                } else if (hit.index - 1 < list.len) {
+                    self.proton.selectCountry(list[hit.index - 1].code);
+                }
+                self.picker = false;
+                self.scroll = 0;
+            },
         }
         self.relayout();
     }
@@ -463,7 +622,7 @@ pub const Ui = struct {
 
         var list_top = header_h;
         if (self.prompt) |p| {
-            if (p.kind == .agent) list_top += self.drawAgentPrompt(cr, w, list_top, p);
+            if (p.isBlock()) list_top += self.drawPromptBlock(cr, w, list_top, p);
         }
 
         const m = self.nm.model;
@@ -474,40 +633,48 @@ pub const Ui = struct {
         c.cairo_rectangle(cr, 0, list_top, w, self.list_h);
         c.cairo_clip(cr);
         var y = list_top - self.scroll;
-        switch (m.status) {
-            .no_device => {
-                self.drawMessage(cr, w, y, "No Wi-Fi device found");
-                y += message_h;
-            },
-            .disabled => {
-                self.drawMessage(cr, w, y, "Wi-Fi is off");
-                y += message_h;
-            },
-            else => {
-                if (m.networks.len == 0) {
-                    self.drawMessage(cr, w, y, "Looking for networks\u{2026}");
+        if (self.picker) {
+            self.drawPicker(cr, w, y);
+        } else {
+            switch (m.status) {
+                .no_device => {
+                    self.drawMessage(cr, w, y, "No Wi-Fi device found");
                     y += message_h;
-                } else {
-                    for (m.networks, 0..) |net, i| {
-                        self.drawRow(cr, w, y, i, net, m.status);
-                        y += row_h;
-                        if (self.prompt) |p| {
-                            if (p.kind == .wifi and std.mem.eql(u8, p.kind.wifi, net.ssid)) {
-                                self.drawWifiPrompt(cr, w, y, p);
-                                y += entry_h;
+                },
+                .disabled => {
+                    self.drawMessage(cr, w, y, "Wi-Fi is off");
+                    y += message_h;
+                },
+                else => {
+                    if (m.networks.len == 0) {
+                        self.drawMessage(cr, w, y, "Looking for networks\u{2026}");
+                        y += message_h;
+                    } else {
+                        for (m.networks, 0..) |net, i| {
+                            self.drawRow(cr, w, y, i, net, m.status);
+                            y += row_h;
+                            if (self.prompt) |p| {
+                                if (p.kind == .wifi and std.mem.eql(u8, p.kind.wifi, net.ssid)) {
+                                    self.drawWifiPrompt(cr, w, y, p);
+                                    y += entry_h;
+                                }
                             }
                         }
                     }
-                }
-            },
-        }
-        if (m.vpns.len > 0) {
-            self.drawSection(cr, w, y, "VPN");
-            y += section_h;
-            for (m.vpns, 0..) |vpn, i| {
-                self.drawVpnRow(cr, w, y, i, vpn);
-                y += row_h;
+                },
             }
+            if (self.otherVpnCount() > 0) {
+                self.drawSection(cr, w, y, "VPN");
+                y += section_h;
+                for (m.vpns, 0..) |vpn, i| {
+                    if (self.isProtonProfile(vpn)) continue;
+                    self.drawVpnRow(cr, w, y, i, vpn);
+                    y += row_h;
+                }
+            }
+            self.drawSection(cr, w, y, "PROTON VPN");
+            y += section_h;
+            self.drawProton(cr, w, y);
         }
         c.cairo_restore(cr);
 
@@ -520,7 +687,7 @@ pub const Ui = struct {
             c.cairo_fill(cr);
         }
 
-        if (self.nm.lastError()) |err| {
+        if (self.footerError()) |err| {
             const fy = h - footer_h - pad / 2;
             self.separator(cr, pad, w - pad, fy + 0.5);
             _ = drawText(cr, pad, fy + footer_h / 2, err, self.theme.font_small, self.theme.danger, w - 2 * pad);
@@ -571,12 +738,16 @@ pub const Ui = struct {
         _ = drawTextAligned(cr, w / 2, y + message_h / 2, text, self.theme.font_regular, self.theme.muted, .center);
     }
 
-    fn drawRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, index: usize, net: nm.Network, status: nm.Status) void {
-        if (self.isHovered(.row, index) and !net.active) {
+    fn hoverRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, h: f64, kind: HitKind, index: usize) void {
+        if (self.isHovered(kind, index)) {
             icon.setColor(cr, self.theme.hover);
-            c.cairo_rectangle(cr, 0, y, w, row_h);
+            c.cairo_rectangle(cr, 0, y, w, h);
             c.cairo_fill(cr);
         }
+    }
+
+    fn drawRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, index: usize, net: nm.Network, status: nm.Status) void {
+        if (!net.active) self.hoverRow(cr, w, y, row_h, .row, index);
 
         const icon_size: f64 = 20;
         const iy = y + (row_h - icon_size) / 2;
@@ -614,26 +785,15 @@ pub const Ui = struct {
         self.addHit(.{ .kind = .row, .index = index, .x = 0, .y = y, .w = w, .h = row_h });
     }
 
-    fn drawVpnRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, index: usize, vpn: nm.Vpn) void {
-        if (self.isHovered(.vpn, index)) {
-            icon.setColor(cr, self.theme.hover);
-            c.cairo_rectangle(cr, 0, y, w, row_h);
-            c.cairo_fill(cr);
-        }
+    /// A row with a lock icon, a name, an optional status and a switch.
+    fn drawSwitchRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, name: []const u8, status: ?[]const u8, on: bool, pending: bool, kind: HitKind, index: usize) void {
+        self.hoverRow(cr, w, y, row_h, kind, index);
         const cy = y + row_h / 2;
         const sw: f64 = 36;
         const sh: f64 = 20;
         const sx = w - pad - sw;
-        const on = vpn.state == .on;
-        const pending = vpn.state == .connecting or vpn.state == .disconnecting;
-        self.drawSwitch(cr, sx, cy - sh / 2, sw, sh, on, pending, self.isHovered(.vpn, index));
+        self.drawSwitch(cr, sx, cy - sh / 2, sw, sh, on, pending, self.isHovered(kind, index));
         var right = sx - 12;
-        const status: ?[]const u8 = switch (vpn.state) {
-            .on => "Connected",
-            .connecting => "Connecting\u{2026}",
-            .disconnecting => "Disconnecting\u{2026}",
-            .off => null,
-        };
         if (status) |s| {
             right -= drawTextAligned(cr, right, cy, s, self.theme.font_small, self.theme.muted, .right) + 8;
         }
@@ -641,8 +801,100 @@ pub const Ui = struct {
         icon.drawLock(cr, pad + 2, cy - icon_size / 2, icon_size, if (on) self.theme.accent else self.theme.text);
         const name_x = pad + 20 + 12;
         const font = if (on) self.theme.font_bold else self.theme.font_regular;
-        _ = drawText(cr, name_x, cy, vpn.id, font, if (on) self.theme.accent else self.theme.text, right - name_x - 6);
-        self.addHit(.{ .kind = .vpn, .index = index, .x = 0, .y = y, .w = w, .h = row_h });
+        _ = drawText(cr, name_x, cy, name, font, if (on) self.theme.accent else self.theme.text, right - name_x - 6);
+        self.addHit(.{ .kind = kind, .index = index, .x = 0, .y = y, .w = w, .h = row_h });
+    }
+
+    fn drawVpnRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, index: usize, vpn: nm.Vpn) void {
+        const status: ?[]const u8 = switch (vpn.state) {
+            .on => "Connected",
+            .connecting => "Connecting\u{2026}",
+            .disconnecting => "Disconnecting\u{2026}",
+            .off => null,
+        };
+        const pending = vpn.state == .connecting or vpn.state == .disconnecting;
+        self.drawSwitchRow(cr, w, y, vpn.id, status, vpn.state == .on, pending, .vpn, index);
+    }
+
+    /// A clickable row with text on the left and an optional value on the right.
+    fn drawLinkRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, h: f64, label: []const u8, value: ?[]const u8, chevron: bool, kind: HitKind, muted: bool) void {
+        self.hoverRow(cr, w, y, h, kind, 0);
+        const cy = y + h / 2;
+        var right = w - pad;
+        if (chevron) {
+            right -= drawTextAligned(cr, right, cy, "\u{203a}", self.theme.font_regular, self.theme.muted, .right) + 8;
+        }
+        if (value) |v| {
+            right -= drawTextAligned(cr, right, cy, v, self.theme.font_regular, self.theme.text, .right) + 8;
+        }
+        const x = pad + 32;
+        _ = drawText(cr, x, cy, label, if (muted) self.theme.font_small else self.theme.font_regular, if (muted) self.theme.muted else self.theme.text, right - x - 6);
+        self.addHit(.{ .kind = kind, .x = 0, .y = y, .w = w, .h = h });
+    }
+
+    fn drawProton(self: *Ui, cr: *c.cairo_t, w: f64, y0: f64) void {
+        var y = y0;
+        const p = self.proton;
+        switch (p.status) {
+            .signed_out => {
+                self.drawLinkRow(cr, w, y, row_h, if (p.busy) |b| b else "Sign in to Proton VPN", null, true, .proton_sign_in, false);
+            },
+            .signing_in => {
+                self.drawLinkRow(cr, w, y, row_h, p.busy orelse "Signing in\u{2026}", null, false, .proton_sign_in, false);
+            },
+            .needs_2fa => {
+                self.drawLinkRow(cr, w, y, row_h, "Enter your two-factor code", null, true, .proton_2fa, false);
+            },
+            .signed_in => {
+                const state = p.vpnState();
+                var status_buf: [160]u8 = undefined;
+                const status: ?[]const u8 = switch (state) {
+                    .on => if (p.lastServer()) |s| (std.fmt.bufPrint(&status_buf, "{s}", .{s}) catch "Connected") else "Connected",
+                    .connecting => "Connecting\u{2026}",
+                    .disconnecting => "Disconnecting\u{2026}",
+                    .off => p.busy,
+                };
+                const pending = state == .connecting or state == .disconnecting or (p.busy != null and state == .off);
+                self.drawSwitchRow(cr, w, y, "Proton VPN", status, state == .on, pending, .proton_toggle, 0);
+                y += row_h;
+                self.drawLinkRow(cr, w, y, row_h, "Country", p.selectedCountryName(), true, .proton_country, false);
+                y += row_h;
+                var acct: [200]u8 = undefined;
+                const who = std.fmt.bufPrint(&acct, "{s} \u{00b7} {s}", .{ p.username(), if (p.plan().len > 0) p.plan() else "Proton VPN" }) catch p.username();
+                self.drawLinkRow(cr, w, y, small_row_h, who, "Sign out", false, .proton_sign_out, true);
+            },
+        }
+    }
+
+    fn drawPicker(self: *Ui, cr: *c.cairo_t, w: f64, y0: f64) void {
+        var y = y0;
+        self.drawLinkRow(cr, w, y, small_row_h, "\u{2039} Back", "Choose a country", false, .picker_back, true);
+        y += small_row_h;
+        const selected = self.proton.selectedCountry();
+        self.drawCountryRow(cr, w, y, 0, "Fastest server", null, selected == null);
+        y += row_h;
+        for (self.proton.countryList(), 0..) |cn, i| {
+            var count_buf: [32]u8 = undefined;
+            const count = std.fmt.bufPrint(&count_buf, "{d} servers", .{cn.servers}) catch "";
+            const is_selected = selected != null and std.mem.eql(u8, &selected.?, &cn.code);
+            self.drawCountryRow(cr, w, y, i + 1, cn.name, count, is_selected);
+            y += row_h;
+        }
+    }
+
+    fn drawCountryRow(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, index: usize, name: []const u8, detail: ?[]const u8, selected: bool) void {
+        self.hoverRow(cr, w, y, row_h, .country, index);
+        const cy = y + row_h / 2;
+        var right = w - pad;
+        if (selected) {
+            right -= drawTextAligned(cr, right, cy, "\u{2713}", self.theme.font_regular, self.theme.accent, .right) + 10;
+        }
+        if (detail) |d| {
+            right -= drawTextAligned(cr, right, cy, d, self.theme.font_small, self.theme.muted, .right) + 8;
+        }
+        const x = pad + 32;
+        _ = drawText(cr, x, cy, name, if (selected) self.theme.font_bold else self.theme.font_regular, if (selected) self.theme.accent else self.theme.text, right - x - 6);
+        self.addHit(.{ .kind = .country, .index = index, .x = 0, .y = y, .w = w, .h = row_h });
     }
 
     fn drawWifiPrompt(self: *Ui, cr: *c.cairo_t, w: f64, y: f64, p: Prompt) void {
@@ -654,15 +906,13 @@ pub const Ui = struct {
         _ = self.drawButton(cr, "Connect", w - pad, fy + field_h / 2, true, .connect, 0);
     }
 
-    /// Draws the agent prompt block below the header; returns its height.
-    fn drawAgentPrompt(self: *Ui, cr: *c.cairo_t, w: f64, top: f64, p: Prompt) f64 {
-        const req = p.kind.agent;
+    /// Draws a prompt block below the header; returns its height.
+    fn drawPromptBlock(self: *Ui, cr: *c.cairo_t, w: f64, top: f64, p: Prompt) f64 {
         var y = top + 8;
-        _ = drawText(cr, pad, y + 13, req.title, self.theme.font_bold, self.theme.text, w - 2 * pad);
+        _ = drawText(cr, pad, y + 13, p.title, self.theme.font_bold, self.theme.text, w - 2 * pad);
         y += 26;
-        if (req.retry or req.message != null) {
-            const msg: []const u8 = if (req.message) |m| m else "The previous credentials were rejected";
-            _ = drawText(cr, pad, y + 11, msg, self.theme.font_small, if (req.retry) self.theme.danger else self.theme.muted, w - 2 * pad);
+        if (p.message) |msg| {
+            _ = drawText(cr, pad, y + 11, msg, self.theme.font_small, if (p.message_danger) self.theme.danger else self.theme.muted, w - 2 * pad);
             y += 22;
         }
         for (p.fields, 0..) |*f, i| {
@@ -672,7 +922,12 @@ pub const Ui = struct {
         }
         const by = y + 20;
         var right = w - pad;
-        right -= self.drawButton(cr, "Connect", right, by, true, .connect, 0) + 8;
+        const submit_label: []const u8 = switch (p.kind) {
+            .proton_login => "Sign in",
+            .proton_2fa => "Verify",
+            else => "Connect",
+        };
+        right -= self.drawButton(cr, submit_label, right, by, true, .connect, 0) + 8;
         _ = self.drawButton(cr, "Cancel", right, by, false, .prompt_cancel, 0);
         y += 40 + 8;
         self.separator(cr, 0, w, y - 0.5);

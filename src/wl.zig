@@ -124,6 +124,13 @@ pub const Client = struct {
     layer_shell: ?*c.zwlr_layer_shell_v1 = null,
     layer_shell_version: u32 = 0,
     viewporter: ?*c.wp_viewporter = null,
+    data_device_manager: ?*c.wl_data_device_manager = null,
+    data_device: ?*c.wl_data_device = null,
+    primary_manager: ?*c.zwp_primary_selection_device_manager_v1 = null,
+    primary_device: ?*c.zwp_primary_selection_device_v1 = null,
+    /// The current clipboard and primary-selection offers, if any.
+    clipboard: Selection = .{},
+    primary: Selection = .{},
     seat: ?*c.wl_seat = null,
     pointer: ?*c.wl_pointer = null,
     keyboard: ?*c.wl_keyboard = null,
@@ -172,6 +179,10 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.destroyPopup();
+        if (self.clipboard.offer) |o| c.wl_data_offer_destroy(@ptrCast(o));
+        if (self.primary.offer) |o| c.zwp_primary_selection_offer_v1_destroy(@ptrCast(o));
+        if (self.data_device) |d| c.wl_data_device_release(d);
+        if (self.primary_device) |d| c.zwp_primary_selection_device_v1_destroy(d);
         if (self.cursor_surface) |s| c.wl_surface_destroy(s);
         if (self.cursor_theme) |t| c.wl_cursor_theme_destroy(t);
         if (self.xkb_state) |s| c.xkb_state_unref(s);
@@ -233,11 +244,18 @@ pub const Client = struct {
             self.layer_shell = @ptrCast(c.wl_registry_bind(registry, name, &c.zwlr_layer_shell_v1_interface, self.layer_shell_version));
         } else if (std.mem.eql(u8, iface, "wp_viewporter")) {
             self.viewporter = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_viewporter_interface, 1));
+        } else if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
+            self.data_device_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_data_device_manager_interface, @min(version, 3)));
+            self.setupSelections();
+        } else if (std.mem.eql(u8, iface, "zwp_primary_selection_device_manager_v1")) {
+            self.primary_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.zwp_primary_selection_device_manager_v1_interface, 1));
+            self.setupSelections();
         } else if (std.mem.eql(u8, iface, "wl_seat")) {
             if (self.seat != null) return;
             const seat: *c.wl_seat = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_seat_interface, @min(version, 7)) orelse return);
             self.seat = seat;
             _ = c.wl_seat_add_listener(seat, &seat_listener, self);
+            self.setupSelections();
         } else if (std.mem.eql(u8, iface, "wl_output")) {
             const output: *c.wl_output = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_output_interface, @min(version, 2)) orelse return);
             self.outputs.append(self.gpa, .{ .wl = output, .name = name }) catch {
@@ -288,6 +306,189 @@ pub const Client = struct {
             if (o.wl == output) return o.scale;
         }
         return 1;
+    }
+
+    // ---- clipboard / primary selection ---------------------------------
+
+    /// An offer as advertised by the compositor and the text types it carries.
+    const Selection = struct {
+        offer: ?*anyopaque = null,
+        utf8: bool = false,
+        plain: bool = false,
+
+        fn reset(sel: *Selection) void {
+            sel.* = .{};
+        }
+
+        fn mime(sel: Selection) ?[*:0]const u8 {
+            if (sel.utf8) return "text/plain;charset=utf-8";
+            if (sel.plain) return "text/plain";
+            return null;
+        }
+
+        fn noteMime(sel: *Selection, mime_type: []const u8) void {
+            if (std.ascii.eqlIgnoreCase(mime_type, "text/plain;charset=utf-8") or std.ascii.eqlIgnoreCase(mime_type, "UTF8_STRING")) sel.utf8 = true;
+            if (std.ascii.eqlIgnoreCase(mime_type, "text/plain") or std.ascii.eqlIgnoreCase(mime_type, "TEXT") or std.ascii.eqlIgnoreCase(mime_type, "STRING")) sel.plain = true;
+        }
+    };
+
+    /// Creates the per-seat selection devices once both the seat and a
+    /// manager are known.
+    fn setupSelections(self: *Client) void {
+        const seat = self.seat orelse return;
+        if (self.data_device == null) {
+            if (self.data_device_manager) |m| {
+                if (c.wl_data_device_manager_get_data_device(m, seat)) |d| {
+                    self.data_device = d;
+                    _ = c.wl_data_device_add_listener(d, &data_device_listener, self);
+                }
+            }
+        }
+        if (self.primary_device == null) {
+            if (self.primary_manager) |m| {
+                if (c.zwp_primary_selection_device_manager_v1_get_device(m, seat)) |d| {
+                    self.primary_device = d;
+                    _ = c.zwp_primary_selection_device_v1_add_listener(d, &primary_device_listener, self);
+                }
+            }
+        }
+    }
+
+    const data_device_listener: c.wl_data_device_listener = .{
+        .data_offer = onDataOffer,
+        .enter = onDndEnter,
+        .leave = onDndLeave,
+        .motion = onDndMotion,
+        .drop = onDndDrop,
+        .selection = onSelection,
+    };
+
+    const data_offer_listener: c.wl_data_offer_listener = .{
+        .offer = onOfferMime,
+        .source_actions = onOfferSourceActions,
+        .action = onOfferAction,
+    };
+
+    const primary_device_listener: c.zwp_primary_selection_device_v1_listener = .{
+        .data_offer = onPrimaryOffer,
+        .selection = onPrimarySelection,
+    };
+
+    const primary_offer_listener: c.zwp_primary_selection_offer_v1_listener = .{
+        .offer = onPrimaryOfferMime,
+    };
+
+    /// Offers announce their mime types before becoming the selection, so
+    /// the types are collected per offer and copied over on `selection`.
+    const OfferInfo = struct { sel: Selection = .{} };
+
+    fn onDataOffer(_: ?*anyopaque, _: ?*c.wl_data_device, offer: ?*c.wl_data_offer) callconv(.c) void {
+        const info = std.heap.c_allocator.create(OfferInfo) catch return;
+        info.* = .{};
+        _ = c.wl_data_offer_add_listener(offer, &data_offer_listener, info);
+    }
+
+    fn onOfferMime(data: ?*anyopaque, _: ?*c.wl_data_offer, mime_type: [*c]const u8) callconv(.c) void {
+        const info: *OfferInfo = @ptrCast(@alignCast(data orelse return));
+        info.sel.noteMime(std.mem.span(mime_type));
+    }
+
+    fn onOfferSourceActions(_: ?*anyopaque, _: ?*c.wl_data_offer, _: u32) callconv(.c) void {}
+    fn onOfferAction(_: ?*anyopaque, _: ?*c.wl_data_offer, _: u32) callconv(.c) void {}
+    fn onDndEnter(_: ?*anyopaque, _: ?*c.wl_data_device, _: u32, _: ?*c.wl_surface, _: c.wl_fixed_t, _: c.wl_fixed_t, _: ?*c.wl_data_offer) callconv(.c) void {}
+    fn onDndLeave(_: ?*anyopaque, _: ?*c.wl_data_device) callconv(.c) void {}
+    fn onDndMotion(_: ?*anyopaque, _: ?*c.wl_data_device, _: u32, _: c.wl_fixed_t, _: c.wl_fixed_t) callconv(.c) void {}
+    fn onDndDrop(_: ?*anyopaque, _: ?*c.wl_data_device) callconv(.c) void {}
+
+    fn onSelection(data: ?*anyopaque, _: ?*c.wl_data_device, offer: ?*c.wl_data_offer) callconv(.c) void {
+        const self = fromData(data);
+        if (self.clipboard.offer) |old| c.wl_data_offer_destroy(@ptrCast(old));
+        self.clipboard.reset();
+        const o = offer orelse {
+            log.debug("clipboard cleared", .{});
+            return;
+        };
+        const info: *OfferInfo = @ptrCast(@alignCast(c.wl_data_offer_get_user_data(o) orelse return));
+        self.clipboard = info.sel;
+        self.clipboard.offer = o;
+        std.heap.c_allocator.destroy(info);
+        log.debug("clipboard offer: utf8={} plain={}", .{ self.clipboard.utf8, self.clipboard.plain });
+    }
+
+    fn onPrimaryOffer(_: ?*anyopaque, _: ?*c.zwp_primary_selection_device_v1, offer: ?*c.zwp_primary_selection_offer_v1) callconv(.c) void {
+        const info = std.heap.c_allocator.create(OfferInfo) catch return;
+        info.* = .{};
+        _ = c.zwp_primary_selection_offer_v1_add_listener(offer, &primary_offer_listener, info);
+    }
+
+    fn onPrimaryOfferMime(data: ?*anyopaque, _: ?*c.zwp_primary_selection_offer_v1, mime_type: [*c]const u8) callconv(.c) void {
+        const info: *OfferInfo = @ptrCast(@alignCast(data orelse return));
+        info.sel.noteMime(std.mem.span(mime_type));
+    }
+
+    fn onPrimarySelection(data: ?*anyopaque, _: ?*c.zwp_primary_selection_device_v1, offer: ?*c.zwp_primary_selection_offer_v1) callconv(.c) void {
+        const self = fromData(data);
+        if (self.primary.offer) |old| c.zwp_primary_selection_offer_v1_destroy(@ptrCast(old));
+        self.primary.reset();
+        const o = offer orelse return;
+        const info: *OfferInfo = @ptrCast(@alignCast(c.zwp_primary_selection_offer_v1_get_user_data(o) orelse return));
+        self.primary = info.sel;
+        self.primary.offer = o;
+        std.heap.c_allocator.destroy(info);
+        log.debug("primary selection offer: utf8={} plain={}", .{ self.primary.utf8, self.primary.plain });
+    }
+
+    pub const Source = enum { clipboard, primary };
+
+    /// Reads the text of the clipboard or primary selection. Caller owns
+    /// the result. Null when there is no text or the owner does not answer
+    /// within a short time.
+    pub fn readSelection(self: *Client, gpa: Allocator, source: Source) ?[]u8 {
+        const sel = switch (source) {
+            .clipboard => self.clipboard,
+            .primary => self.primary,
+        };
+        const offer = sel.offer orelse {
+            log.debug("paste: no {t} offer", .{source});
+            return null;
+        };
+        const mime_type = sel.mime() orelse {
+            log.debug("paste: {t} offer has no text", .{source});
+            return null;
+        };
+        var fds: [2]std.posix.fd_t = undefined;
+        if (std.os.linux.pipe2(&fds, .{ .CLOEXEC = true }) != 0) return null;
+        switch (source) {
+            .clipboard => c.wl_data_offer_receive(@ptrCast(offer), mime_type, fds[1]),
+            .primary => c.zwp_primary_selection_offer_v1_receive(@ptrCast(offer), mime_type, fds[1]),
+        }
+        _ = c.close(fds[1]);
+        _ = c.wl_display_flush(self.display);
+        defer _ = c.close(fds[0]);
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        var buf: [4096]u8 = undefined;
+        var deadline: i32 = 1000;
+        while (deadline > 0) {
+            var pfd = [_]c.struct_pollfd{.{ .fd = fds[0], .events = c.POLLIN, .revents = 0 }};
+            const ready = c.poll(&pfd, 1, 100);
+            if (ready < 0) break;
+            if (ready == 0) {
+                deadline -= 100;
+                continue;
+            }
+            const n = c.read(fds[0], &buf, buf.len);
+            if (n <= 0) break;
+            out.appendSlice(gpa, buf[0..@intCast(n)]) catch break;
+            if (out.items.len > 64 * 1024) break;
+        }
+        log.debug("paste: read {d} bytes from the {t}", .{ out.items.len, source });
+        if (out.items.len == 0) {
+            out.deinit(gpa);
+            return null;
+        }
+        return out.toOwnedSlice(gpa) catch null;
     }
 
     // ---- seat ----------------------------------------------------------
