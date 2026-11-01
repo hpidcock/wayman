@@ -375,20 +375,20 @@ fn runClockStatus(init: std.process.Init, fmt_text: []const u8) !void {
     defer gpa.free(fmt);
     const per_second = clock.showsSeconds(fmt);
 
-    // Follow zone changes when the system bus is reachable.
-    var td: ?clock.Timedate = null;
+    // Follow zone changes when the system bus is reachable. `init` registers
+    // a D-Bus filter that keeps a pointer to the Timedate, so it is
+    // initialised in place and never copied.
+    var td_storage: clock.Timedate = undefined;
+    var td: ?*clock.Timedate = null;
     var td_fd: ?std.posix.fd_t = null;
     const sys = dbus.Connection.open(.system) catch null;
     if (sys) |conn| {
-        // Initialise into a plain value first: unwrapping an optional that
-        // was assigned `undefined` reads an undefined null tag.
-        var tmp: clock.Timedate = undefined;
-        if (tmp.init(gpa, conn)) {
-            td = tmp;
+        if (td_storage.init(gpa, conn)) {
+            td = &td_storage;
             td_fd = conn.fd() catch null;
         } else |_| {}
     }
-    defer if (td) |*t| t.deinit();
+    defer if (td) |t| t.deinit();
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buf);
